@@ -68,6 +68,19 @@
     },
     {
       "group": "조향튜닝",
+      "name": "CarrotLatControl",
+      "title": "*당근조향제어필터(5)",
+      "descr": "필터링개수",
+      "egroup": "LAT",
+      "etitle": "*Carrot lateral filter(5)",
+      "edescr": "",
+      "min": 2,
+      "max": 30,
+      "default": 5,
+      "unit": 1
+    },
+    {
+      "group": "조향튜닝",
       "name": "LatMpcPathCost",
       "title": "*LATMPC.PathCost(100)",
       "descr": "경로추종가중치, 높으면 경로우선시함.",

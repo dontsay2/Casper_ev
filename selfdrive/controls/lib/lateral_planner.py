@@ -74,8 +74,9 @@ class LateralPlanner:
     self.curve_speed = 0
     
     self.prev_path_xyz = None
-    self.path_history = deque(maxlen=5)
     self.carrot_lat_control = 0
+    self.carrot_lat_filter = 5
+    self.path_history = deque(maxlen=self.carrot_lat_filter)
 
   def reset_mpc(self, x0=None):
     if x0 is None:
@@ -96,6 +97,10 @@ class LateralPlanner:
       LATERAL_JERK_COST = self.params.get_float("LatMpcJerkCost") * 0.01
       STEERING_RATE_COST = self.params.get_float("LatMpcSteeringRateCost")
       self.carrot_lat_control = self.params.get_int("CarrotLatControl")
+      carrot_lat_filter = self.params.get_int("CarrotLatFilter")
+      if carrot_lat_filter != self.carrot_lat_filter:
+        self.carrot_lat_filter = carrot_lat_filter
+        self.path_history = deque(maxlen=self.carrot_lat_filter)
 
     # clip speed , lateral planning is not possible at 0 speed
     measured_curvature = sm['controlsState'].curvature
@@ -163,7 +168,7 @@ class LateralPlanner:
     """
 
     if self.carrot_lat_control in [1,2]:
-      if self.plan_a[0] < -1.0:
+      if False: #self.plan_a[0] < -1.0:
         self.path_history.clear()
       
       self.path_history.append(self.path_xyz)
