@@ -78,6 +78,9 @@ class LateralPlanner:
     self.carrot_lat_filter = 5
     self.path_history = deque(maxlen=self.carrot_lat_filter)
 
+    self.lateralMotionCost = LATERAL_MOTION_COST
+    self.lateralMotionCost2 = LATERAL_MOTION_COST
+
   def reset_mpc(self, x0=None):
     if x0 is None:
       x0 = np.zeros(4)
@@ -85,14 +88,15 @@ class LateralPlanner:
     self.lat_mpc.reset(x0=self.x0)
 
   def update(self, sm):
-    global PATH_COST, LATERAL_ACCEL_COST, LATERAL_JERK_COST, STEERING_RATE_COST, LATERAL_MOTION_COST
+    global PATH_COST, LATERAL_ACCEL_COST, LATERAL_JERK_COST, STEERING_RATE_COST
     self.readParams -= 1
     if self.readParams <= 0:
       self.readParams = 100
       self.useLaneLineSpeedApply = self.params.get_int("UseLaneLineSpeedApply")
       self.pathOffset = 0.0 #float(self.params.get_int("PathOffset")) * 0.01
       PATH_COST = self.params.get_float("LatMpcPathCost") * 0.01
-      LATERAL_MOTION_COST = self.params.get_float("LatMpcMotionCost") * 0.01
+      self.lateralMotionCost = self.params.get_float("LatMpcMotionCost") * 0.01
+      self.lateralMotionCost2 = self.params.get_float("LatMpcMotionCost2") * 0.01
       LATERAL_ACCEL_COST = self.params.get_float("LatMpcAccelCost") * 0.01
       LATERAL_JERK_COST = self.params.get_float("LatMpcJerkCost") * 0.01
       STEERING_RATE_COST = self.params.get_float("LatMpcSteeringRateCost")
@@ -145,6 +149,14 @@ class LateralPlanner:
     else:
       self.LP.lane_change_multiplier = 1.0
 
+    lateral_motion_cost = self.lateralMotionCost
+    atc_type = sm['carrotMan'].atcType
+    if atc_activate:
+      if atc_type == "turn left" and md.meta.desireState[1] > 0.1:
+        lateral_motion_cost = self.lateralMotionCost2
+      elif atc_type == "turn right" and md.meta.desireState[2] > 0.1:
+        lateral_motion_cost = self.lateralMotionCost2
+
     # lanelines calculation?
     self.LP.lanefull_mode = self.useLaneLineMode
     self.LP.lane_width_left = md.meta.laneWidthLeft
@@ -166,15 +178,14 @@ class LateralPlanner:
     self.path_xyz = self.alpha * self.path_xyz + (1 - self.alpha) * self.prev_path_xyz
     self.prev_path_xyz = self.path_xyz
     """
-
     if self.carrot_lat_control in [1,2]:
       if False: #self.plan_a[0] < -1.0:
         self.path_history.clear()
       
       self.path_history.append(self.path_xyz)
       self.path_xyz = np.mean(np.array(self.path_history), axis=0)
-    
-    self.lat_mpc.set_weights(PATH_COST, LATERAL_MOTION_COST,
+
+    self.lat_mpc.set_weights(PATH_COST, lateral_motion_cost,
                              LATERAL_ACCEL_COST, LATERAL_JERK_COST,
                              STEERING_RATE_COST)
 

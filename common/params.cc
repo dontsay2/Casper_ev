@@ -313,6 +313,7 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"CarrotLatFilter", PERSISTENT},
     {"LatMpcPathCost", PERSISTENT },
     {"LatMpcMotionCost", PERSISTENT },
+    {"LatMpcMotionCost2", PERSISTENT },
     {"LatMpcAccelCost", PERSISTENT},
     {"LatMpcJerkCost", PERSISTENT},
     {"LatMpcSteeringRateCost", PERSISTENT},
