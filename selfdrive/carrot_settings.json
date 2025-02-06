@@ -68,7 +68,7 @@
     },
     {
       "group": "조향튜닝",
-      "name": "CarrotLatControl",
+      "name": "CarrotLatFilter",
       "title": "*당근조향제어필터(5)",
       "descr": "필터링개수",
       "egroup": "LAT",
