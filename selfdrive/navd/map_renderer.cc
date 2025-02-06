@@ -221,6 +221,9 @@ void MapRenderer::publish(const double render_time, const bool loaded) {
   auto carrotMan = (*sm)["carrotMan"].getCarrotMan();
   auto location = (*sm)["liveLocationKalman"].getLiveLocationKalman();
   bool valid = loaded && ((carrotMan.getActiveCarrot() > 1) || ((location.getStatus() == cereal::LiveLocationKalman::Status::VALID) && location.getPositionGeodetic().getValid()));
+  if (!valid) {
+    printf("loaded %d, active_carrot %d, status %d, valid %d\n", loaded, carrotMan.getActiveCarrot(), location.getStatus(), location.getPositionGeodetic().getValid());
+  }
   ever_loaded = ever_loaded || loaded;
   uint64_t ts = nanos_since_boot();
   VisionBuf* buf = vipc_server->get_buffer(VisionStreamType::VISION_STREAM_MAP);
