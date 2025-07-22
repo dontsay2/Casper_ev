@@ -386,7 +386,7 @@ class CAR(Platforms):
 
   HYUNDAI_CASPER_EV = HyundaiPlatformConfig(
     [HyundaiCarDocs("Hyundai Casper EV 2024", "All", car_parts=CarParts.common([CarHarness.hyundai_k]))],
-    CarSpecs(mass=1355, wheelbase=2.58, steerRatio=14.3),  # mass: from https://www.hyundai-motor.com.tw/clicktobuy/custin#spec_0, steerRatio: from learner
+    CarSpecs(mass=1836, wheelbase=2.7, steerRatio=13.0, tireStiffnessFactor=1.0),  # mass: from https://www.hyundai-motor.com.tw/clicktobuy/custin#spec_0, steerRatio: from learner
     flags=HyundaiFlags.CAMERA_SCC | HyundaiFlags.CHECKSUM_CRC8 | HyundaiFlags.EV
   )
   HYUNDAI_PORTER_II_EV = HyundaiPlatformConfig(
