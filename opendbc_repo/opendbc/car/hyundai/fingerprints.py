@@ -340,6 +340,17 @@ FW_VERSIONS = {
       b'\xf1\x00TMP MFC  AT USA LHD 1.00 1.06 99211-S1500 220727',
     ],
   },
+  CAR.HYUNDAI_CASPER_EV: {
+    (Ecu.fwdRadar, 0x7d0, None): [
+      b'\xf1\x00AX__ RDR -----      1.00 1.00 99110-GX000         ',
+    ],
+    (Ecu.eps, 0x7d4, None): [
+      b'\xf1\x00AX  MDPS C 1.00 1.01 56300-GX000 4611',
+    ],
+    (Ecu.fwdCamera, 0x7c4, None): [
+      b'\xf1\x00AXE MFC  AT KOR LHD 1.00 1.00 99211-GX000 240615',
+    ],
+  },
   CAR.HYUNDAI_CUSTIN_1ST_GEN: {
     (Ecu.abs, 0x7d1, None): [
       b'\xf1\x00KU ESC \x01 101!\x02\x03 58910-O3200',
