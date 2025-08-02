@@ -14,7 +14,6 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.controls.lib.lane_planner_2 import LanePlanner
 from collections import deque
 
-
 TRAJECTORY_SIZE = 33
 CAMERA_OFFSET = 0.04
 
@@ -59,8 +58,8 @@ class LateralPlanner:
     self.lanelines_active = False
     self.lanelines_active_tmp = False
 
-    self.useLaneLineSpeedApply = self.params.get_int("UseLaneLineSpeedApply")
-    self.pathOffset = 0.0 #float(self.params.get_int("PathOffset")) * 0.01
+    self.useLaneLineSpeedApply = self.params.get_int("UseLaneLineSpeed")
+    self.pathOffset = float(self.params.get_int("PathOffset")) * 0.01
     self.useLaneLineMode = False
     self.plan_a = np.zeros((TRAJECTORY_SIZE, ))
     self.plan_yaw = np.zeros((TRAJECTORY_SIZE,))
@@ -72,10 +71,8 @@ class LateralPlanner:
     self.lat_mpc = LateralMpc()
     self.reset_mpc(np.zeros(4))
     self.curve_speed = 0
-    
-    self.prev_path_xyz = None
-    self.path_history = deque(maxlen=5)
-    self.carrot_lat_control = 0
+    self.lanemode_possible_count = 0
+    self.laneless_only = True
 
   def reset_mpc(self, x0=None):
     if x0 is None:
@@ -83,19 +80,18 @@ class LateralPlanner:
     self.x0 = x0
     self.lat_mpc.reset(x0=self.x0)
 
-  def update(self, sm):
-    global PATH_COST, LATERAL_ACCEL_COST, LATERAL_JERK_COST, STEERING_RATE_COST, LATERAL_MOTION_COST
+  def update(self, sm, carrot):
+    global LATERAL_ACCEL_COST, LATERAL_JERK_COST, STEERING_RATE_COST
     self.readParams -= 1
     if self.readParams <= 0:
       self.readParams = 100
-      self.useLaneLineSpeedApply = self.params.get_int("UseLaneLineSpeedApply")
-      self.pathOffset = 0.0 #float(self.params.get_int("PathOffset")) * 0.01
-      PATH_COST = self.params.get_float("LatMpcPathCost") * 0.01
-      LATERAL_MOTION_COST = self.params.get_float("LatMpcMotionCost") * 0.01
+      self.useLaneLineSpeedApply = sm['carState'].useLaneLineSpeed
+      self.pathOffset = float(self.params.get_int("PathOffset")) * 0.01
+      self.lateralPathCost = self.params.get_float("LatMpcPathCost") * 0.01
+      self.lateralMotionCost = self.params.get_float("LatMpcMotionCost") * 0.01
       LATERAL_ACCEL_COST = self.params.get_float("LatMpcAccelCost") * 0.01
       LATERAL_JERK_COST = self.params.get_float("LatMpcJerkCost") * 0.01
       STEERING_RATE_COST = self.params.get_float("LatMpcSteeringRateCost")
-      self.carrot_lat_control = self.params.get_int("CarrotLatControl")
 
     # clip speed , lateral planning is not possible at 0 speed
     measured_curvature = sm['controlsState'].curvature
@@ -104,7 +100,6 @@ class LateralPlanner:
 
     # Parse model predictions
     md = sm['modelV2']
-    laneless_only = False
     if len(md.position.x) == TRAJECTORY_SIZE and len(md.orientation.x) == TRAJECTORY_SIZE:
       self.path_xyz = np.column_stack([md.position.x, md.position.y, md.position.z])
       self.t_idxs = np.array(md.position.t)
@@ -116,14 +111,19 @@ class LateralPlanner:
       self.v_ego = self.v_plan[0]
       self.plan_a = np.array(md.acceleration.x)
       if md.velocity.x[-1] < md.velocity.x[0] * 0.7:  # TODO: 모델이 감속을 요청하는 경우 속도테이블이 레인모드를 할수 없음. 속도테이블을 새로 만들어야함..
-        laneless_only = True
+        self.lanemode_possible_count = 0
+        self.laneless_only = True
+      else:
+        self.lanemode_possible_count += 1
+        if self.lanemode_possible_count > int(1/DT_MDL):
+          self.laneless_only = False
 
     # Parse model predictions
     self.LP.parse_model(md)
     #lane_change_prob = self.LP.l_lane_change_prob + self.LP.r_lane_change_prob
     #self.DH.update(sm['carState'], md, sm['carControl'].latActive, lane_change_prob, sm)
 
-    if self.useLaneLineSpeedApply == 0 or laneless_only:
+    if self.useLaneLineSpeedApply == 0 or self.laneless_only:
       self.useLaneLineMode = False
     elif self.v_ego*3.6 >= self.useLaneLineSpeedApply + 2:
       self.useLaneLineMode = True
@@ -132,10 +132,8 @@ class LateralPlanner:
 
     # Turn off lanes during lane change
     #if self.DH.desire == log.Desire.laneChangeRight or self.DH.desire == log.Desire.laneChangeLeft:
-    activeCarrot = sm['carrotMan'].activeCarrot
-    xDistToTurn = sm['carrotMan'].xDistToTurn
-    atc_activate = activeCarrot > 1 and 0 < xDistToTurn < 250
-    if md.meta.desire != log.Desire.none or atc_activate:
+      
+    if md.meta.desire != log.Desire.none or carrot.atc_active:
       self.LP.lane_change_multiplier = 0.0 #md.meta.laneChangeProb
     else:
       self.LP.lane_change_multiplier = 1.0
@@ -145,31 +143,17 @@ class LateralPlanner:
     self.LP.lane_width_left = md.meta.laneWidthLeft
     self.LP.lane_width_right = md.meta.laneWidthRight
     self.LP.curvature = measured_curvature
-    self.path_xyz = self.LP.get_d_path(sm['carState'], self.v_ego, self.t_idxs, self.path_xyz, self.curve_speed)
-    if self.LP.lanefull_mode:
-      self.plan_yaw, self.plan_yaw_rate = self.LP.calculate_plan_yaw_and_yaw_rate(self.path_xyz)
+    self.path_xyz, self.lanelines_active = self.LP.get_d_path(sm['carState'], self.v_ego, self.t_idxs, self.path_xyz, self.curve_speed)
+    
+    #if self.LP.lanefull_mode:
+    #  self.plan_yaw, self.plan_yaw_rate = self.LP.calculate_plan_yaw_and_yaw_rate(self.path_xyz)
+      
     self.latDebugText = self.LP.debugText
-    self.lanelines_active = True if self.LP.d_prob > 0.3 and self.LP.lanefull_mode else False
+    #self.lanelines_active = True if self.LP.d_prob > 0.3 and self.LP.lanefull_mode else False
 
     self.path_xyz[:, 1] += self.pathOffset
 
-    """
-    # Smooth path
-    self.alpha = 0.2
-    if self.prev_path_xyz is None:
-      self.prev_path_xyz = self.path_xyz.copy()
-    self.path_xyz = self.alpha * self.path_xyz + (1 - self.alpha) * self.prev_path_xyz
-    self.prev_path_xyz = self.path_xyz
-    """
-
-    if self.carrot_lat_control in [1,2]:
-      if self.plan_a[0] < -1.0:
-        self.path_history.clear()
-      
-      self.path_history.append(self.path_xyz)
-      self.path_xyz = np.mean(np.array(self.path_history), axis=0)
-    
-    self.lat_mpc.set_weights(PATH_COST, LATERAL_MOTION_COST,
+    self.lat_mpc.set_weights(self.lateralPathCost, self.lateralMotionCost,
                              LATERAL_ACCEL_COST, LATERAL_JERK_COST,
                              STEERING_RATE_COST)
 
@@ -208,8 +192,10 @@ class LateralPlanner:
       self.solution_invalid_cnt += 1
     else:
       self.solution_invalid_cnt = 0
+  
+    self.x_sol = self.lat_mpc.x_sol
 
-  def publish(self, sm, pm):
+  def publish(self, sm, pm, carrot):
     plan_solution_valid = self.solution_invalid_cnt < 2
     plan_send = messaging.new_message('lateralPlan')
     plan_send.valid = sm.all_checks(service_list=['carState', 'controlsState', 'modelV2'])
@@ -224,8 +210,13 @@ class LateralPlanner:
     lateralPlan.modelMonoTime = sm.logMonoTime['modelV2']
     lateralPlan.dPathPoints = self.y_pts.tolist()
     lateralPlan.psis = self.lat_mpc.x_sol[0:CONTROL_N, 2].tolist()
+    lateralPlan.distances = self.lat_mpc.x_sol[0:CONTROL_N, 0].tolist()
 
-    lateralPlan.curvatures = (self.lat_mpc.x_sol[0:CONTROL_N, 3]/self.v_ego).tolist()
+    if len(self.v_plan) == TRAJECTORY_SIZE:
+      lateralPlan.curvatures = (self.lat_mpc.x_sol[0:CONTROL_N, 3] / self.v_plan[0:CONTROL_N]).tolist()
+    else:
+      lateralPlan.curvatures = (self.lat_mpc.x_sol[0:CONTROL_N, 3] / self.v_ego).tolist()
+
     lateralPlan.curvatureRates = [float(x.item() / self.v_ego) for x in self.lat_mpc.u_sol[0:CONTROL_N - 1]] + [0.0]
 
     lateralPlan.mpcSolutionValid = bool(plan_solution_valid)

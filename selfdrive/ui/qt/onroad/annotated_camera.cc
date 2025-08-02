@@ -4,6 +4,7 @@
 #include <QPainter>
 #include <algorithm>
 #include <cmath>
+#include <unistd.h>
 #include <exception>
 #include <iostream>
 #include <execinfo.h>
@@ -42,25 +43,28 @@ void AnnotatedCameraWidget::updateState(const UIState &s) {
   experimental_btn->updateState(s);
   dmon.updateState(s);
 
-  Params	params_memory{ "/dev/shm/params" };
-  QString command = QString::fromStdString(params_memory.get("CarrotManCommand"));
-  if (command.startsWith("RECORD ")) {
-      QString recording = command.mid(7);
-      if (recording == "START") {
+  static int carrot_cmd_index_last = 0;
+  SubMaster& sm = *(s.sm);
+  if (sm.alive("carrotMan")) {
+    const auto& carrot = sm["carrotMan"].getCarrotMan();
+    int carrot_cmd_index = carrot.getCarrotCmdIndex();
+    if (carrot_cmd_index != carrot_cmd_index_last) {
+      carrot_cmd_index_last = carrot_cmd_index;
+      QString carrot_cmd = QString::fromStdString(carrot.getCarrotCmd());
+      QString carrot_arg = QString::fromStdString(carrot.getCarrotArg());
+      if (carrot_cmd == "RECORD") {
+        if (carrot_arg == "START") {
           recorder->start();
-          printf("Start recording\n");
-      }
-      else if (recording == "STOP") {
+        }
+        else if (carrot_arg == "STOP") {
           recorder->stop();
-          printf("Stop recording\n");
-      }
-      else if (recording == "TOGGLE") {
+        }
+        else if (carrot_arg == "TOGGLE") {
           recorder->toggle();
-          printf("Toggle recording\n");
+        }
       }
-      params_memory.putNonBlocking("CarrotManCommand", "");
+    }
   }
-
 }
 
 void AnnotatedCameraWidget::initializeGL() {
@@ -172,7 +176,8 @@ void AnnotatedCameraWidget::paintEvent(QPaintEvent *event) {
       } else if (v_ego > 15) {
         wide_cam_requested = false;
       }
-      wide_cam_requested = wide_cam_requested && sm["selfdriveState"].getSelfdriveState().getExperimentalMode();
+      //wide_cam_requested = wide_cam_requested && sm["selfdriveState"].getSelfdriveState().getExperimentalMode();
+      wide_cam_requested = wide_cam_requested && s->scene.carrot_experimental_mode;
     }
     painter.beginNativePainting();
     CameraWidget::setStreamType(wide_cam_requested ? VISION_STREAM_WIDE_ROAD : VISION_STREAM_ROAD);

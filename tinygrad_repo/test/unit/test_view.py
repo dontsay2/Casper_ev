@@ -39,6 +39,21 @@ class TestView(unittest.TestCase):
     v = View.create(shape=(2,3,4), mask=((0,2),(0,3),(0,4)))
     self.assertTrue(v.contiguous)
 
+  def test_reshape_all_invalid(self):
+    v = View.create((4,5), mask=((0,0), (0,0))).reshape((20,))
+    self.assertIsNotNone(v)
+    self.assertEqual(v, View.create((20,), mask=((0,0),)))
+
+  def test_add_0(self):
+    v1 = View.create((2,3,4))
+    v2 = View.create((2,0,4))
+    self.assertEqual(v2, v1+v2)
+
+  def test_add_0_masked(self):
+    v1 = View.create((2,3,4), mask=((0, 0), (0, 0), (0, 0)))
+    v2 = View.create((2,0,4))
+    self.assertEqual(v2, v1+v2)
+
 class TestMergeDims(unittest.TestCase):
   def test_contiguous(self):
     shape = (2, 3, 4)

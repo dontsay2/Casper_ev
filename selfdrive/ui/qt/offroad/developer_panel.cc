@@ -1,10 +1,6 @@
-#include <QDebug>
-#include <QProcess>
-
 #include "selfdrive/ui/qt/offroad/developer_panel.h"
 #include "selfdrive/ui/qt/widgets/ssh_keys.h"
 #include "selfdrive/ui/qt/widgets/controls.h"
-#include "common/util.h"
 
 DeveloperPanel::DeveloperPanel(SettingsWindow *parent) : ListWidget(parent) {
   adbToggle = new ParamControl("AdbEnabled", tr("Enable ADB"),
@@ -30,7 +26,7 @@ DeveloperPanel::DeveloperPanel(SettingsWindow *parent) : ListWidget(parent) {
   addItem(longManeuverToggle);
 
   experimentalLongitudinalToggle = new ParamControl(
-    "ExperimentalLongitudinalEnabled",
+    "AlphaLongitudinalEnabled",
     tr("openpilot Longitudinal Control (Alpha)"),
     QString("<b>%1</b><br><br>%2")
       .arg(tr("WARNING: openpilot longitudinal control is in alpha for this car and will disable Automatic Emergency Braking (AEB)."))
@@ -72,8 +68,8 @@ void DeveloperPanel::updateToggles(bool _offroad) {
     capnp::FlatArrayMessageReader cmsg(aligned_buf.align(cp_bytes.data(), cp_bytes.size()));
     cereal::CarParams::Reader CP = cmsg.getRoot<cereal::CarParams>();
 
-    if (!CP.getExperimentalLongitudinalAvailable() || is_release) {
-      params.remove("ExperimentalLongitudinalEnabled");
+    if (!CP.getAlphaLongitudinalAvailable() || is_release) {
+      params.remove("AlphaLongitudinalEnabled");
       experimentalLongitudinalToggle->setEnabled(false);
     }
 
@@ -82,13 +78,14 @@ void DeveloperPanel::updateToggles(bool _offroad) {
      * - is not a release branch, and
      * - the car supports experimental longitudinal control (alpha)
      */
-    experimentalLongitudinalToggle->setVisible(CP.getExperimentalLongitudinalAvailable() && !is_release);
+    experimentalLongitudinalToggle->setVisible(CP.getAlphaLongitudinalAvailable() && !is_release);
 
     longManeuverToggle->setEnabled(hasLongitudinalControl(CP) && _offroad);
   } else {
     longManeuverToggle->setEnabled(false);
     experimentalLongitudinalToggle->setVisible(false);
   }
+  experimentalLongitudinalToggle->refresh();
 
   offroad = _offroad;
 }

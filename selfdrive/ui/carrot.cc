@@ -4,6 +4,11 @@
 #include <cmath>
 #include <limits>
 
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonValue>
+#include <QJsonArray>
+
 //#define __TEST
 //#define __UI_TEST
 
@@ -46,8 +51,6 @@
 
 constexpr float MIN_DRAW_DISTANCE = 10.0;
 constexpr float MAX_DRAW_DISTANCE = 100.0;
-
-static bool IS_TIMEZONE_SET = false;
 
 ModelRenderer* _model = NULL;
 extern  int get_path_length_idx(const cereal::XYZTData::Reader& line, const float path_height);
@@ -221,8 +224,8 @@ static inline void fill_rect(NVGcontext* vg, const Rect1& r, const NVGcolor* col
     if (stroke_width > 0) {
         nvgStrokeWidth(vg, stroke_width);
         if (stroke_color) nvgStrokeColor(vg, *stroke_color);
-		else nvgStrokeColor(vg, nvgRGB(0, 0, 0));
-        nvgStroke(vg);
+		else nvgStrokeColor(vg, nvgRGB(0, 0, 0));   
+        nvgStroke(vg);                         
     }
 }
 
@@ -312,6 +315,9 @@ protected:
         }
 
     }
+    Params  params;
+    std::deque<float> minDeque[3];  // 최소값을 유지하는 덱
+    std::deque<float> maxDeque[3];  // 최대값을 유지하는 덱
     void	makePlotData(const UIState* s, float data[], char* title) {
 
         SubMaster& sm = *(s->sm);
@@ -356,18 +362,18 @@ protected:
             data[1] = velocity.getX()[32];
             data[2] = velocity.getX()[0];
             sprintf(title, "3.Model(Y:pos_32, G:vel_32, O:vel_0)");
-			break;
+			      break;
         case 4:
-            data[0] = a_ego;
+            data[0] = accel;
             data[1] = lead_radar.getALeadK();
             data[2] = lead_radar.getVRel();
-            sprintf(title, "4.Lead(Y:a_ego, G:a_lead, O:v_rel)");
+            sprintf(title, "4.Lead(Y:accel, G:a_lead, O:v_rel)");
             break;
         case 5:
             data[0] = a_ego;
             data[1] = lead_radar.getALead();
-            data[2] = lead_radar.getALeadK();
-            sprintf(title, "5.Lead(Y:a_ego, G:a_lead, O:a_lead_k)");
+            data[2] = lead_radar.getJLead();
+            sprintf(title, "5.Lead(Y:a_ego, G:a_lead, O:j_lead)");
             break;
         case 6:
             data[0] = torque_state.getActualLateralAccel() * 10.0;
@@ -381,6 +387,12 @@ protected:
             data[2] = live_params.getAngleOffsetDeg() * 10.0;
             sprintf(title, "7.SteerA (Y:Actual, G:Target, O:Offset*10)");
             break;
+        case 8:
+            data[0] = car_control.getActuators().getCurvature()*10000;
+            data[1] = car_control.getActuators().getCurvature()*10000;
+            data[2] = car_control.getActuators().getCurvature()*10000;
+            sprintf(title, "8.SteerA (Y:Actual, G:Target, O:Offset*10)");
+            break;
         default:
             data[0] = data[1] = data[2] = 0;
             sprintf(title, "no data");
@@ -391,13 +403,13 @@ protected:
             plotIndex = 0;
             plotMin = 0.;
             plotMax = 0.;
+            for (int i = 0; i < 3; i++) {
+              minDeque[i].clear();
+              maxDeque[i].clear();
+            }
             show_plot_mode_prev = show_plot_mode;
         }
     }
-
-    Params  params;
-    std::deque<float> minDeque[3];  // 최소값을 유지하는 덱
-    std::deque<float> maxDeque[3];  // 최대값을 유지하는 덱
 
     void updatePlotQueue(float plot_data[3]) {
         // plotIndex 업데이트
@@ -487,7 +499,8 @@ public:
     }
 };
 
-class ModelDrawer {
+class ModelDrawer : public QObject{
+      Q_OBJECT
 protected:
     template <class T>
     float interp(float x, std::initializer_list<T> x_list, std::initializer_list<T> y_list, bool extrapolate)
@@ -578,6 +591,7 @@ private:
     float   v_ego = 0.0;
     bool    brakeHoldActive = false;
     int    softHoldActive = 0;
+    int    carrotCruise = 0;
     bool    longActive = false;
 
     float   t_follow = 0.0;
@@ -593,6 +607,7 @@ protected:
         v_ego = sm["carState"].getCarState().getVEgo();
         brakeHoldActive = sm["carState"].getCarState().getBrakeHoldActive();
         softHoldActive = sm["carState"].getCarState().getSoftHoldActive();
+        carrotCruise = sm["carState"].getCarState().getCarrotCruise();
         auto selfdrive_state = sm["selfdriveState"].getSelfdriveState();
         longActive = selfdrive_state.getEnabled();
         //longActive = sm["carControl"].getCarControl().getLongActive();
@@ -661,7 +676,7 @@ protected:
         return true;
 	};
     bool isLeadSCC() {
-        return radarTrackId == 0;
+        return radarTrackId < 2;
     }
     bool isRadarDetected() {
         return radarTrackId >= 0;
@@ -682,18 +697,18 @@ public:
         int disp_y = y + 195;// 175;
         bool draw_dist = false;
         float disp_size = 50;
-        if (softHoldActive || brakeHoldActive) {
-            sprintf(str, "%s", (brakeHoldActive) ? "AUTOHOLD" : "SOFTHOLD");
+        if (softHoldActive || brakeHoldActive || carrotCruise) {
+            sprintf(str, "%s", (brakeHoldActive) ? "AUTOHOLD" : (softHoldActive) ? "SOFTHOLD": "CARROT");
             ui_draw_text(s, x, disp_y, str, disp_size, COLOR_WHITE, BOLD);
         }
         else if (longActive) {
             if (xState == 3 || xState == 5) {      //XState.e2eStop, XState.e2eStopped
                 if (v_ego < 1.0) {
-                    sprintf(str, "%s", (trafficState >= 1000) ? "信号错误" : "等待信号");
+                    sprintf(str, "%s", (trafficState >= 1000) ? tr("Signal Error").toStdString().c_str(): tr("Signal Ready").toStdString().c_str());
                     ui_draw_text(s, x, disp_y, str, disp_size, COLOR_WHITE, BOLD);
                 }
                 else {
-                    ui_draw_text(s, x, disp_y, "减速信号", disp_size, COLOR_WHITE, BOLD);
+                    ui_draw_text(s, x, disp_y, tr("Signal slowing").toStdString().c_str(), disp_size, COLOR_WHITE, BOLD);
                 }
 #if 0
                 else if (getStopDist() > 0.5) {
@@ -705,8 +720,8 @@ public:
 #endif
             }
             else if (xState == 4) {     //XState.e2ePrepare
-				ui_draw_text(s, x, disp_y, "起步信号", disp_size, COLOR_WHITE, BOLD);
-			}
+				      ui_draw_text(s, x, disp_y, "E2E주행중", disp_size, COLOR_WHITE, BOLD);
+			      }
             else if (xState == 0 || xState == 1 || xState == 2) {     //XState.lead
                 draw_dist = true;
             }
@@ -736,11 +751,13 @@ public:
             }
         }
         QPolygonF tf_vertext;
-        tf_vertext.push_back(tf_vertex_left);
-        tf_vertext.push_back(tf_vertex_right);
-        ui_draw_line(s, tf_vertext, nullptr, nullptr, 3.0, COLOR_WHITE);
-        sprintf(str, "%.1f(%.2f)", tf_distance, t_follow);
-        ui_draw_text(s, tf_vertex_right.x(), tf_vertex_right.y(), str, 25, COLOR_WHITE, BOLD);
+        if (tf_distance > 0) {
+          tf_vertext.push_back(tf_vertex_left);
+          tf_vertext.push_back(tf_vertex_right);
+          ui_draw_line(s, tf_vertext, nullptr, nullptr, 3.0, COLOR_WHITE);
+          sprintf(str, "%.1f(%.2f)", tf_distance, t_follow);
+          ui_draw_text(s, tf_vertex_right.x(), tf_vertex_right.y(), str, 25, COLOR_WHITE, BOLD);
+        }
 
 
         float px[7], py[7];
@@ -898,8 +915,8 @@ protected:
         if (xDistToTurn < 1500 && xDistToTurn > 0) {
             SubMaster& sm = *(s->sm);
 
-            const auto carrot_man = sm["carrotMan"].getCarrotMan();
-            szTBTMainText = QString::fromStdString(carrot_man.getSzTBTMainText());
+            //const auto carrot_man = sm["carrotMan"].getCarrotMan();
+            //szTBTMainText = QString::fromStdString(carrot_man.getSzTBTMainText());
 
             const cereal::ModelDataV2::Reader& model = sm["modelV2"].getModelV2();
             const auto road_edges = model.getRoadEdges();
@@ -1017,26 +1034,25 @@ protected:
                 nvgCircle(s->vg, bx, by, 110 / 2 * scale);
                 nvgFillColor(s->vg, COLOR_WHITE);
                 nvgFill(s->vg);
-                sprintf(str, "%d", xSpdLimit);
+                sprintf(str, "%d", (int)(xSpdLimit * ((s->scene.is_metric)?1:KM_TO_MILE) + 0.5));
                 ui_draw_text(s, bx, by + 25 * scale - 6 * (1 - scale), str, 60 * scale, COLOR_BLACK, BOLD, 0.0f, 0.0f);
             }
         }
 	}
-    void drawTurnInfoHud(const UIState* s) {
-      if (s->fb_w < 1200) return;
+    int  drawTurnInfoHud(const UIState* s) {
+      if (s->fb_w < 1200) return -1;
 #ifdef __UI_TEST
         active_carrot = 2;
         nGoPosDist = 500000;
         nGoPosTime = 4 * 60 * 60;
-        szSdiDescr = "注意学校";
+        szSdiDescr = "어린이 보호구역(스쿨존 시작 구간)";
         xTurnInfo = 1;
         xDistToTurn = 1000;
         szPosRoadName = "구문천 1길 17";
 #endif
 
-        if (active_carrot <= 1) return;
-        if (nGoPosDist > 0 && nGoPosTime > 0);
-		    else return;
+        //if (active_carrot <= 1) return;
+        //printf("nGoPosDist=%d, nGoPosTime=%d\n", nGoPosDist, nGoPosTime);
 
         //if (xDistToTurn <= 0 || nGoPosDist <= 0) return;
         char str[128] = "";
@@ -1047,6 +1063,9 @@ protected:
         if (s->scene._current_carrot_display == 3) {
           ui_fill_rect(s->vg, { tbt_x, 5, 790, s->fb_h - 15 }, COLOR_BLACK_ALPHA(120), 30, 2, &stroke_color);
         }
+        if (nGoPosDist > 0 && nGoPosTime > 0);
+        else return -1;
+        if (s->scene._current_carrot_display == 3);
         else {
           ui_fill_rect(s->vg, { tbt_x, tbt_y - 60, 790, 240 + 60 }, COLOR_BLACK_ALPHA(120), 30, 2, &stroke_color);
         }
@@ -1071,9 +1090,9 @@ protected:
             case 4: ui_draw_image(s, { bx - icon_size / 2, by - icon_size / 2, icon_size, icon_size }, "ic_lane_change_r", 1.0f); break;
             case 7: ui_draw_image(s, { bx - icon_size / 2, by - icon_size / 2, icon_size, icon_size }, "ic_turn_u", 1.0f); break;
             case 6: ui_draw_text(s, bx, by + 20, "TG", 35, COLOR_WHITE, BOLD); break;
-            case 8: ui_draw_text(s, bx, by + 20, "目的地", 35, COLOR_WHITE, BOLD); break;
+            case 8: ui_draw_text(s, bx, by + 20, "목적지", 35, COLOR_WHITE, BOLD); break;
             default:
-                sprintf(str, "减速:%d", xTurnInfo);
+                sprintf(str, "감속:%d", xTurnInfo);
                 ui_draw_text(s, bx, by + 20, str, 35, COLOR_WHITE, BOLD);
                 break;
             }
@@ -1107,31 +1126,54 @@ protected:
             sprintf(str, "%.1fkm", nGoPosDist / 1000.);
             ui_draw_text(s, tbt_x + 190 + 120, tbt_y + 130, str, 50, COLOR_WHITE, BOLD);
         }
+        return 0;
     }
 public:
-    void draw(const UIState* s) {
+    int draw(const UIState* s) {
         nvgTextAlign(s->vg, NVG_ALIGN_CENTER | NVG_ALIGN_BOTTOM);
         SubMaster& sm = *(s->sm);
         if (!sm.alive("modelV2") || !sm.alive("carrotMan") || !sm.alive("carState")) {
             active_carrot = -1;
-            return;
+            return -1;
         }
         const auto carrot_man = sm["carrotMan"].getCarrotMan();
-        //const auto car_state = sm["carState"].getCarState();
-        xSpdLimit = carrot_man.getXSpdLimit();
-        xSpdDist = carrot_man.getXSpdDist();
-        xSignType = carrot_man.getXSpdType();
+          
+        active_carrot = carrot_man.getActiveCarrot();
+
+        if (active_carrot > 1) {
+          xSpdLimit = carrot_man.getXSpdLimit();
+          xSpdDist = carrot_man.getXSpdDist();
+          xSignType = carrot_man.getXSpdType();
+        }
+        else {
+          xSpdLimit = 0;
+          xSpdDist = 0;
+          xSignType = 0;
+        }
         xTurnInfo = carrot_man.getXTurnInfo();
         xDistToTurn = carrot_man.getXDistToTurn();
         nRoadLimitSpeed = carrot_man.getNRoadLimitSpeed();
-        active_carrot = carrot_man.getActiveCarrot();
-        atc_type = QString::fromStdString(carrot_man.getAtcType());
+        if (active_carrot > 1 || carrot_man.getNGoPosDist() > 0) {
+          atc_type = QString::fromStdString(carrot_man.getAtcType());
 
-        nGoPosDist = carrot_man.getNGoPosDist();
-        nGoPosTime = carrot_man.getNGoPosTime();
-        szSdiDescr = QString::fromStdString(carrot_man.getSzSdiDescr());
-        szPosRoadName = QString::fromStdString(carrot_man.getSzPosRoadName());
-        szTBTMainText = QString::fromStdString(carrot_man.getSzTBTMainText());
+          nGoPosDist = carrot_man.getNGoPosDist();
+          nGoPosTime = carrot_man.getNGoPosTime();
+          szSdiDescr = QString::fromStdString(carrot_man.getSzSdiDescr());
+          szPosRoadName = QString::fromStdString(carrot_man.getSzPosRoadName());
+          szTBTMainText = QString::fromStdString(carrot_man.getSzTBTMainText());
+          
+        }
+        else {
+          //xTurnInfo = -1;
+          //xDistToTurn = 0;
+          //nRoadLimitSpeed = 20;
+          atc_type = "";
+          nGoPosDist = 0;
+          nGoPosTime = 0;
+          szSdiDescr = "";
+          szPosRoadName = "";
+          szTBTMainText = "";
+        }
 
 #ifdef __UI_TEST
         active_carrot = 2;
@@ -1139,62 +1181,9 @@ public:
         xSpdDist = 12345;
         nRoadLimitSpeed = 110;
 #endif
-        if (false) {
-            int bx = s->fb_w - 120;// 350;// 150;
-            int by = 300;// s->fb_h - 150; // 410;
-            char str[128] = "";
-
-            if (xSpdLimit > 0) {
-                if (xSignType == 22) {
-                    ui_draw_image(s, { bx - 60, by - 50, 120, 150 }, "ic_speed_bump", 1.0f);
-                }
-                else {
-                    nvgBeginPath(s->vg);
-                    nvgCircle(s->vg, bx, by, 140 / 2);
-                    nvgFillColor(s->vg, COLOR_WHITE);
-                    nvgFill(s->vg);
-                    nvgBeginPath(s->vg);
-                    nvgCircle(s->vg, bx, by, 130 / 2);
-                    nvgFillColor(s->vg, COLOR_RED);
-                    nvgFill(s->vg);
-                    nvgBeginPath(s->vg);
-                    nvgCircle(s->vg, bx, by, 110 / 2);
-                    nvgFillColor(s->vg, COLOR_WHITE);
-                    nvgFill(s->vg);
-                    sprintf(str, "%d", xSpdLimit);
-                    ui_draw_text(s, bx, by + 25, str, 60, COLOR_BLACK, BOLD, 0.0f, 0.0f);
-                }
-                if (xSpdDist < 1000) sprintf(str, "%d m", xSpdDist);
-                else  sprintf(str, "%.1f km", xSpdDist / 1000.f);
-                ui_draw_text(s, bx, by + 120, str, 40, COLOR_WHITE, BOLD);
-            }
-            else if (false && xTurnInfo > 0) {
-                switch (xTurnInfo) {
-                case 1: ui_draw_image(s, { bx - icon_size / 2, by - icon_size / 2, icon_size, icon_size }, "ic_turn_l", 1.0f); break;
-                case 2: ui_draw_image(s, { bx - icon_size / 2, by - icon_size / 2, icon_size, icon_size }, "ic_turn_r", 1.0f); break;
-                case 3: ui_draw_image(s, { bx - icon_size / 2, by - icon_size / 2, icon_size, icon_size }, "ic_lane_change_l", 1.0f); break;
-                case 4: ui_draw_image(s, { bx - icon_size / 2, by - icon_size / 2, icon_size, icon_size }, "ic_lane_change_r", 1.0f); break;
-                case 7: ui_draw_image(s, { bx - icon_size / 2, by - icon_size / 2, icon_size, icon_size }, "ic_turn_u", 1.0f); break;
-                case 6: ui_draw_text(s, bx, by + 20, "TG", 35, COLOR_WHITE, BOLD); break;
-                case 8: ui_draw_text(s, bx, by + 20, "arrived", 35, COLOR_WHITE, BOLD); break;
-                default:
-                    sprintf(str, "unknown(%d)", xTurnInfo);
-                    ui_draw_text(s, bx, by + 20, str, 35, COLOR_WHITE, BOLD, 0.0f, 0.0f);
-                    break;
-                }
-                if (xDistToTurn < 1000) sprintf(str, "%d m", xDistToTurn);
-                else  sprintf(str, "%.1f km", xDistToTurn / 1000.f);
-                ui_draw_text(s, bx, by + 120, str, 40, COLOR_WHITE, BOLD);
-            }
-            else if (active_carrot > 1 && nRoadLimitSpeed >= 30 && nRoadLimitSpeed < 200) {
-                ui_draw_image(s, { bx - 60, by - 50, 120, 150 }, "ic_road_speed", 1.0f);
-                sprintf(str, "%d", nRoadLimitSpeed);
-                ui_draw_text(s, bx, by + 75, str, 50, COLOR_BLACK, BOLD, 0.0f, 0.0f);
-            }
-        }
         drawTurnInfo(s);
         drawSpeedLimit(s);
-        drawTurnInfoHud(s);
+        return drawTurnInfoHud(s);
 
     }
 };
@@ -1256,8 +1245,8 @@ public:
         const auto car_state = sm["carState"].getCarState();
         QString atc_type = QString::fromStdString(carrot_man.getAtcType());
 
-        bool left_blinker = car_state.getLeftBlinker() || atc_type=="fork left" || atc_type =="turn left";
-        bool right_blinker = car_state.getRightBlinker() || atc_type=="fork right" || atc_type =="turn right";
+        bool left_blinker = car_state.getLeftBlinker() || atc_type=="fork left" || atc_type =="turn left" || atc_type == "atc left";
+        bool right_blinker = car_state.getRightBlinker() || atc_type=="fork right" || atc_type =="turn right" || atc_type == "atc right";
 
         _right_blinker = false;
         _left_blinker = false;
@@ -1617,6 +1606,8 @@ protected:
     int use_lane_line_speed_apply = 0;
 public:
     void draw(const UIState* s, float& pathDrawSeq) {
+        SubMaster& sm = *(s->sm);
+        auto car_state = sm["carState"].getCarState();
         params_count = (params_count + 1) % 20;
         if (params_count == 0) {
             show_path_mode_normal = params.getInt("ShowPathMode");
@@ -1627,9 +1618,9 @@ public:
             show_path_color_cruise_off = params.getInt("ShowPathColorCruiseOff");
         }
         if (!make_data(s)) return;
-        int temp = params.getInt("UseLaneLineSpeedApply");
+        int temp = (int)car_state.getUseLaneLineSpeed();
         if (temp != use_lane_line_speed_apply) {
-            ui_draw_text_a(s, 0, 0, (temp>0)?"LaneMode":"Laneless", 30, COLOR_GREEN, BOLD);
+            ui_draw_text_a(s, 0, 0, (temp>0)?"LaneMode":"Laneless", 30, (temp>0)?COLOR_GREEN:COLOR_YELLOW, BOLD);
             use_lane_line_speed_apply = temp;
         }
         static bool forward = true;
@@ -1642,8 +1633,6 @@ public:
             COLOR_WHITE_ALPHA(alpha),         COLOR_BLACK_ALPHA(alpha),
         };
 
-        SubMaster& sm = *(s->sm);
-        auto car_state = sm["carState"].getCarState();
         bool brake_valid = car_state.getBrakeLights();
 
         if (show_path_mode == 0) {
@@ -1859,11 +1848,6 @@ private:
 };
 
 
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonValue>
-#include <QJsonArray>
-
 typedef struct {
     float x, y, d, v, y_rel, v_lat, radar;
 } lead_vertex_data;
@@ -1889,11 +1873,12 @@ public:
     int     trafficState = 0;
     int     trafficState_carrot = 0;
     int     active_carrot = 0;
-    float   xTarget = 0.0;
+    float   cruiseTarget = 0.0;
     int     myDrivingMode = 1;
 
     QString szPosRoadName = "";
     int     nRoadLimitSpeed = 30;
+    int     nGoPosDist = 0;
     int     xSpdLimit = 0;
     int     xSignType = -1;
     QPointF nav_path_vertex[150];
@@ -1938,6 +1923,7 @@ public:
             nRoadLimitSpeed = carrot_man.getNRoadLimitSpeed();
             xSpdLimit = carrot_man.getXSpdLimit();
             xSignType = carrot_man.getXSpdType();
+            nGoPosDist = carrot_man.getNGoPosDist();
             QString atcType = QString::fromStdString(carrot_man.getAtcType());
             trafficState_carrot = carrot_man.getTrafficState();
             const auto velocity = model.getVelocity();
@@ -1949,7 +1935,7 @@ public:
               int max_z = lane_lines[2].getZ().size();
               float z_offset = 0.0;
               foreach(const QString & pair, pairs) {
-                QStringList xy = pair.split(",");  // ","로 x와 y 구분
+                QStringList xy = pair.split(",");  // ","로 x와 y 구분                
                 if (xy.size() == 3) {
                   //printf("coords = x: %.1f, y: %.1f, d:%.1f\n", xy[0].toFloat(), xy[1].toFloat(), xy[2].toFloat());
                   float x = xy[0].toFloat();
@@ -1966,9 +1952,9 @@ public:
             }
             auto meta = sm["modelV2"].getModelV2().getMeta();
             QString desireLog = QString::fromStdString(meta.getDesireLog());
-            sprintf(carrot_man_debug, "model_kph= %d, %s, %dkm/h TBT(%d): %dm, CAM(%d): %dkm/h, %dm, ATC(%s), T(%d)",
-                (int)(velocity.getX()[32] * 3.6),
+            sprintf(carrot_man_debug, "%s, m_kph= %d, %dkm/h TBT(%d): %dm, CAM(%d): %dkm/h, %dm, ATC(%s), T(%d)",
                 desireLog.toStdString().c_str(),
+                (int)(velocity.getX()[32] * 3.6),
                 carrot_man.getDesiredSpeed(),
                 carrot_man.getXTurnInfo(),
                 carrot_man.getXDistToTurn(),
@@ -1978,17 +1964,19 @@ public:
                 atcType.toStdString().c_str(),
                 carrot_man.getTrafficState());
         }
-		else {
-            active_carrot = 0;
-			apply_speed = 250.0;
-            apply_source = "";
-            carrot_man_debug[0] = 0;
-            szPosRoadName = "";
-            nRoadLimitSpeed = 30;
-		}
+		    else {
+          active_carrot = 0;
+			    apply_speed = 250.0;
+          apply_source = "";
+          carrot_man_debug[0] = 0;
+          szPosRoadName = "";
+          nRoadLimitSpeed = 30;
+          nGoPosDist = 0;
+		    }
+
         xState = lp.getXState();
         trafficState = lp.getTrafficState();
-        xTarget = lp.getXTarget();
+        cruiseTarget = lp.getCruiseTarget();
         myDrivingMode = lp.getMyDrivingMode();
 
         s->max_distance = std::clamp(*(model_position.getX().end() - 1),
@@ -2018,7 +2006,7 @@ public:
                 }
             }
         }
-	}
+	  }
     void drawRadarInfo(UIState* s) {
         char str[128];
         int show_radar_info = params.getInt("ShowRadarInfo");
@@ -2028,7 +2016,7 @@ public:
                 auto [rx, ry, rd, rv, ry_rel, v_lat, radar] = vrd;
 
                 if (rv < -1.0 || rv > 1.0) {
-                    sprintf(str, "%.0f", rv * 3.6);
+                    sprintf(str, "%.0f", (s->scene.is_metric)? rv * MS_TO_KPH : rv * MS_TO_MPH);
                     wStr = 35 * (strlen(str) + 0);
                     ui_fill_rect(s->vg, { (int)(rx - wStr / 2), (int)(ry - 35), wStr, 42 }, (!radar) ? COLOR_BLUE : (rv > 0.) ? COLOR_GREEN : COLOR_RED, 15);
                     ui_draw_text(s, rx, ry, str, 40, COLOR_WHITE, BOLD);
@@ -2062,7 +2050,7 @@ public:
     void drawDebug(UIState* s) {
         if (params.getInt("ShowDebugUI") > 1) {
             nvgTextAlign(s->vg, NVG_ALIGN_RIGHT | NVG_ALIGN_BOTTOM);
-            ui_draw_text(s, s->fb_w, s->fb_h - 10, carrot_man_debug, 35, COLOR_WHITE, BOLD, 1.0f, 1.0f);
+            ui_draw_text(s, s->fb_w, s->fb_h - 10, carrot_man_debug, 25, COLOR_WHITE, BOLD, 1.0f, 1.0f);
         }
     }
     void drawNaviPath(UIState* s) {
@@ -2122,12 +2110,16 @@ public:
     int     gap_last = 0;
     char    gear_str_last[32] = "";
     int     blink_timer = 0;
+    int     disp_timer = 0;
     float cpuTemp = 0.0f;
     float cpuUsage = 0.0f;
     int   memoryUsage = 0;
     float freeSpace = 0.0f;
+    float voltage = 0.0f;
     void drawHud(UIState* s) {
+        int show_device_state = params.getInt("ShowDeviceState");
         blink_timer = (blink_timer + 1) % 16;
+        disp_timer = (disp_timer + 1) % 64; 
         nvgTextAlign(s->vg, NVG_ALIGN_CENTER | NVG_ALIGN_BOTTOM);
 
         int x = 140;// 120;
@@ -2143,7 +2135,12 @@ public:
         if (xSpdLimit > 0 && xSignType != 22 && xSignType != 4) cam_detected = true;
         NVGcolor stroke_color = COLOR_WHITE;
         NVGcolor bg_color = (cam_detected && blink_timer > 8)?COLOR_RED_ALPHA(180):COLOR_BLACK_ALPHA(90);
-        ui_fill_rect(s->vg, { bx - 120, by - 270, 475, 495}, bg_color, 30, 2, &stroke_color);
+        if (show_device_state > 0) {
+          ui_fill_rect(s->vg, { bx - 120, by - 270, 475, 495 }, bg_color, 30, 2, &stroke_color);
+        }
+        else {
+          ui_fill_rect(s->vg, { bx - 120, by - 270 + 140, 475, 495 - 140 }, bg_color, 30, 2, &stroke_color);
+        }
 
 
         // draw traffic light
@@ -2165,7 +2162,7 @@ public:
 
         // draw speed
         char speed[32];
-        sprintf(speed, "%.0f", v_ego * 3.6);
+        sprintf(speed, "%.0f", (s->scene.is_metric)? v_ego * MS_TO_KPH : v_ego * MS_TO_MPH);
         ui_draw_text(s, bx, by + 50, speed, 120, COLOR_WHITE, BOLD, 3.0f, 8.0f);
         ui_draw_image(s, { bx - 100, by - 60, 350, 150 }, "ic_speed_bg", 1.0f);
 
@@ -2173,13 +2170,13 @@ public:
         char cruise_speed[32];
         int cruise_x = bx + 170;
         int cruise_y = by + 15;
-        if(longActive) sprintf(cruise_speed, "%.0f", v_cruise);
-		else sprintf(cruise_speed, "--");
+        if(longActive) sprintf(cruise_speed, "%d", (int)((s->scene.is_metric)?v_cruise: v_cruise * KM_TO_MILE + 0.5));
+		    else sprintf(cruise_speed, "--");
         if (strcmp(cruise_speed_last, cruise_speed) != 0) {
-			strcpy(cruise_speed_last, cruise_speed);
-            if(strcmp(cruise_speed, "--"))
-                ui_draw_text_a(s, cruise_x, cruise_y, cruise_speed, 60, COLOR_GREEN, BOLD);
-		}
+			    strcpy(cruise_speed_last, cruise_speed);
+          if(strcmp(cruise_speed, "--"))
+            ui_draw_text_a(s, cruise_x, cruise_y, cruise_speed, 60, COLOR_GREEN, BOLD);
+		    }
         ui_draw_text(s, cruise_x, cruise_y, cruise_speed, 60, COLOR_GREEN, BOLD, 1.0, 5.0, COLOR_BLACK, COLOR_BLACK);
 
         // draw apply speed
@@ -2190,20 +2187,20 @@ public:
         int apply_y = by - 50;
 
         if (apply_source.length()) {
-            sprintf(apply_speed_str, "%.0f", apply_speed);
+            sprintf(apply_speed_str, "%d", (int)((s->scene.is_metric)?apply_speed:apply_speed * KM_TO_MILE + 0.5));
             textColor = COLOR_OCHRE;    // apply speed가 작동되면... 색을 바꾸자.
             ui_draw_text(s, apply_x, apply_y, apply_speed_str, 50, textColor, BOLD, 1.0, 5.0, COLOR_BLACK, COLOR_BLACK);
             ui_draw_text(s, apply_x, apply_y - 50, apply_source.toStdString().c_str(), 30, textColor, BOLD, 1.0, 5.0, COLOR_BLACK, COLOR_BLACK);
         }
-		else if(abs(xTarget - v_cruise) > 0.5) {
-            sprintf(apply_speed_str, "%.0f", xTarget);
-			ui_draw_text(s, apply_x, apply_y, apply_speed_str, 50, textColor, BOLD, 1.0, 5.0, COLOR_BLACK, COLOR_BLACK);
+		    else if(abs(cruiseTarget - v_cruise) > 0.5) {
+            sprintf(apply_speed_str, "%d", (int)((s->scene.is_metric)?cruiseTarget: cruiseTarget * KM_TO_MILE + 0.5));
+			      ui_draw_text(s, apply_x, apply_y, apply_speed_str, 50, textColor, BOLD, 1.0, 5.0, COLOR_BLACK, COLOR_BLACK);
             ui_draw_text(s, apply_x, apply_y - 50, "eco", 30, textColor, BOLD, 1.0, 5.0, COLOR_BLACK, COLOR_BLACK);
-		}
+		    }
         const SubMaster& sm = *(s->sm);
 
         // draw gap info
-        char driving_mode_str[32] = "风格";
+        char driving_mode_str[32] = "연비";
         int driving_mode = myDrivingMode;// params.getInt("MyDrivingMode");
         NVGcolor mode_color = COLOR_GREEN_ALPHA(210);
         NVGcolor text_color = COLOR_WHITE;
@@ -2217,12 +2214,12 @@ public:
         int dx = bx - 50;
         int dy = by + 175;
         ui_fill_rect(s->vg, { dx - 55, dy - 38, 110, 48 }, mode_color, 15, 2);
-        ui_draw_text(s, dx, dy, driving_mode_str, 40, text_color, BOLD);
+        ui_draw_text(s, dx, dy, driving_mode_str, 32, text_color, BOLD);
         if (strcmp(driving_mode_str, driving_mode_str_last)) ui_draw_text_a(s, dx, dy, driving_mode_str, 30, COLOR_WHITE, BOLD);
         strcpy(driving_mode_str_last, driving_mode_str);
 
         auto locationd = sm["liveLocationKalman"].getLiveLocationKalman();
-        bool is_gps_valid = locationd.getGpsOK();
+        bool is_gps_valid = sm.valid("liveLocationKalman") && locationd.getGpsOK();
         if (is_gps_valid) {
           ui_draw_text(s, dx, dy - 45, "GPS", 30, COLOR_GREEN, BOLD);
         }
@@ -2290,7 +2287,7 @@ public:
             ui_fill_rect(s->vg, { dx - 55, dy - 38, 110, 48 }, COLOR_BLUE_ALPHA(210), 15, 2);
             ui_draw_text(s, dx, dy, "APM", 40, COLOR_WHITE, BOLD);
         }
-        if (nav_path_vertex_count > 0) {
+        if (nav_path_vertex_count > 1) {
             ui_draw_text(s, dx, dy - 45, "ROUTE", 30, COLOR_WHITE, BOLD);
 		}
 #ifdef __UI_TEST
@@ -2300,19 +2297,21 @@ public:
         xSignType = 1;
 #endif
 
-        if (active_carrot >= 2) {
+        //if (active_carrot >= 2 || nGoPosDist > 0) {
+        if (true) {
             dx = bx + 75;
             dy = by + 175;
             int disp_speed = 0;
             NVGcolor limit_color = COLOR_GREEN_ALPHA(210);
             if (xSpdLimit > 0 && xSignType != 22) {
-                disp_speed = xSpdLimit;
+                disp_speed = (int)(xSpdLimit * ((s->scene.is_metric)?1:KM_TO_MILE) + 0.5);
                 limit_color = (blink_timer <= 8) ? COLOR_RED_ALPHA(210) : COLOR_YELLOW_ALPHA(210);
                 ui_draw_text(s, dx, dy-45, "CAM", 30, COLOR_WHITE, BOLD);
             }
             else {
                 disp_speed = nRoadLimitSpeed;
-                limit_color = (v_ego * 3.6 > nRoadLimitSpeed + 2) ? COLOR_RED_ALPHA(210) : COLOR_WHITE_ALPHA(210);
+		            disp_speed = (int)(disp_speed * ((s->scene.is_metric)?1.0:KM_TO_MILE) + 0.5);
+                limit_color = (v_ego * 3.6 > disp_speed + 2) ? COLOR_RED_ALPHA(210) : COLOR_WHITE_ALPHA(210);
                 ui_draw_text(s, dx, dy - 45, "LIMIT", 30, COLOR_WHITE, BOLD);
             }
 
@@ -2320,7 +2319,7 @@ public:
             ui_draw_text(s, dx, dy, QString::number(disp_speed).toStdString().c_str(), 40, COLOR_WHITE, BOLD);
         }
 
-        if (true) {
+        if (show_device_state) {
             char str[128];
             dx = bx - 35;
             dy = by - 200;
@@ -2337,10 +2336,18 @@ public:
             ui_draw_text(s, dx, dy + 40, str, 40, COLOR_WHITE, BOLD);
 
             dx += 150;
-            ui_fill_rect(s->vg, { dx - 65, dy - 38, 130, 90 }, mode_color, 15, 2);
-            ui_draw_text(s, dx, dy-5, "DISK", 25, COLOR_WHITE, BOLD);
-            sprintf(str, "%.0f%%", 100 - freeSpace);
-            ui_draw_text(s, dx, dy + 40, str, 40, COLOR_WHITE, BOLD);
+            if (disp_timer < 32) {
+              ui_fill_rect(s->vg, { dx - 65, dy - 38, 130, 90 }, mode_color, 15, 2);
+              ui_draw_text(s, dx, dy - 5, "DISK", 25, COLOR_WHITE, BOLD);
+              sprintf(str, "%.0f%%", 100 - freeSpace);
+              ui_draw_text(s, dx, dy + 40, str, 40, COLOR_WHITE, BOLD);
+            }
+            else {
+              ui_fill_rect(s->vg, { dx - 65, dy - 38, 130, 90 }, mode_color, 15, 2);
+              ui_draw_text(s, dx, dy - 5, "VOLT", 25, COLOR_WHITE, BOLD);
+              sprintf(str, "%.1fV", voltage);
+              ui_draw_text(s, dx, dy + 40, str, 40, COLOR_WHITE, BOLD);
+            }
         }
     }
     void drawDateTime(const UIState* s) {
@@ -2348,12 +2355,6 @@ public:
         // 시간표시
         int show_datetime = params.getInt("ShowDateTime");
         if (show_datetime) {
-            if(IS_TIMEZONE_SET == false)
-            {
-                setenv("TZ", "Asia/Shanghai", 1);
-                tzset();
-                IS_TIMEZONE_SET = true;
-            }
             time_t now = time(nullptr);
             struct tm* local = localtime(&now);
 
@@ -2369,7 +2370,7 @@ public:
             }
             if (show_datetime == 1 || show_datetime == 3) {
                 //strftime(str, sizeof(str), "%m-%d-%a", local);
-                const char* weekdays_ko[] = { "日", "一", "二", "三", "四", "五", "六" };
+                const char* weekdays_ko[] = { "일", "월", "화", "수", "목", "금", "토" };
                 strftime(str, sizeof(str), "%m-%d", local); // 날짜만 가져옴
                 int weekday_index = local->tm_wday; // tm_wday: 0=일, 1=월, ..., 6=토
                 snprintf(str + strlen(str), sizeof(str) - strlen(str), "(%s)", weekdays_ko[weekday_index]);
@@ -2463,6 +2464,27 @@ public:
         ui_draw_text(s, bx - dw, by + 70, get_tpms_text(rl), 40, get_tpms_color(rl), BOLD);
         ui_draw_text(s, bx + dw, by + 70, get_tpms_text(rr), 40, get_tpms_color(rr), BOLD);
     }
+    void drawTpms3(const UIState* s) {
+      nvgTextAlign(s->vg, NVG_ALIGN_CENTER | NVG_ALIGN_BOTTOM);
+      SubMaster& sm = *(s->sm);
+      auto car_state = sm["carState"].getCarState();
+
+      int bx = s->fb_w - 125;
+      int by = s->fb_h - 280 / 2 + 15;
+      auto tpms = car_state.getTpms();
+      float fl = tpms.getFl();
+      float fr = tpms.getFr();
+      float rl = tpms.getRl();
+      float rr = tpms.getRr();
+#ifdef __UI_TEST
+      fl = fr = rl = rr = 29;
+#endif
+      int dw = 80;
+      ui_draw_text(s, bx - dw, by - 55, get_tpms_text(fl), 40, get_tpms_color(fl), BOLD);
+      ui_draw_text(s, bx + dw, by - 55, get_tpms_text(fr), 40, get_tpms_color(fr), BOLD);
+      ui_draw_text(s, bx - dw, by + 70, get_tpms_text(rl), 40, get_tpms_color(rl), BOLD);
+      ui_draw_text(s, bx + dw, by + 70, get_tpms_text(rr), 40, get_tpms_color(rr), BOLD);
+    }
     void makeDeviceInfo(const UIState* s) {
         SubMaster& sm = *(s->sm);
         auto deviceState = sm["deviceState"].getDeviceState();
@@ -2486,6 +2508,9 @@ public:
             }
             if (cpu_size > 0) cpuUsage /= cpu_size;
         }
+
+        auto peripheralState = sm["peripheralState"].getPeripheralState();
+        voltage = peripheralState.getVoltage() / 1000.0;
     }
     void drawDeviceInfo(const UIState* s) {
 #ifdef WSL2
@@ -2643,7 +2668,7 @@ void ui_draw(UIState *s, ModelRenderer* model_renderer, int w, int h) {
   int path_x = drawPathEnd.getPathX();
   int path_y = drawPathEnd.getPathY();
   drawDesire.draw(s, path_x, path_y - 135);
-
+  
 
   drawPlot.draw(s);
 
@@ -2657,10 +2682,22 @@ void ui_draw(UIState *s, ModelRenderer* model_renderer, int w, int h) {
   drawCarrot.drawDateTime(s);
   //drawCarrot.drawConnInfo(s);
   drawCarrot.drawDeviceInfo(s);
-  drawCarrot.drawTpms2(s);
+  int show_tpms = params.getInt("ShowTpms");
+  switch (show_tpms) {
+  case 0: break;
+  case 1:
+    drawCarrot.drawTpms2(s);
+    break;
+  case 2:
+    drawCarrot.drawTpms3(s);
+    break;
+  case 3:
+    drawCarrot.drawTpms2(s);
+    drawCarrot.drawTpms3(s);
+    break;
+  }
 
   drawTurnInfo.draw(s);
-
 
   ui_draw_text_a2(s);
   ui_draw_alert(s);
@@ -2752,10 +2789,12 @@ public:
         str = QString::fromStdString(car_state.getLogCarrot());
         sprintf(top, "%s", str.toStdString().c_str());
         // top_right
+        const auto live_delay = sm["liveDelay"].getLiveDelay();
         const auto live_torque_params = sm["liveTorqueParameters"].getLiveTorqueParameters();
         const auto live_params = sm["liveParameters"].getLiveParameters();
-        str.sprintf("LT[%.0f,%s](%.2f/%.2f), SR(%.1f,%.1f)",
-            live_torque_params.getTotalBucketPoints(), live_torque_params.getLiveValid() ? "ON" : "OFF",
+        str.sprintf("LD[%.0f%%,%.2f],LT[%.0f%%,%s](%.2f/%.2f), SR(%.1f,%.1f)",
+            (float)live_delay.getCalPerc(), live_delay.getLateralDelay(),
+            (float)live_torque_params.getCalPerc(), live_torque_params.getLiveValid() ? "ON" : "OFF",
             live_torque_params.getLatAccelFactorFiltered(), live_torque_params.getFrictionCoefficientFiltered(),
             live_params.getSteerRatio(), params.getFloat("CustomSR")/10.0);
         sprintf(top_right, "%s", str.toStdString().c_str());
@@ -2768,6 +2807,10 @@ public:
         }
         else if (longitudinal_control) {
             carName += " - OP Long";
+        }
+        QString NNFFModelName = QString::fromStdString(params.get("NNFFModelName"));
+        if (NNFFModelName.length() > 0) {
+            carName += ",NNFF";
         }
         sprintf(top_left, "%s", carName.toStdString().c_str());
 

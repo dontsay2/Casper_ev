@@ -7,7 +7,7 @@ import cereal.messaging as messaging
 
 from cereal import car, log
 from msgq.visionipc import VisionIpcClient, VisionStreamType
-from panda import ALTERNATIVE_EXPERIENCE
+from opendbc.safety import ALTERNATIVE_EXPERIENCE
 
 
 from openpilot.common.params import Params
@@ -21,6 +21,7 @@ from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroad_alert
 from openpilot.selfdrive.controls.lib.latcontrol import MIN_LATERAL_CONTROL_SPEED
 
+from openpilot.system.hardware import HARDWARE
 from openpilot.system.version import get_build_metadata
 
 REPLAY = "REPLAY" in os.environ
@@ -65,22 +66,28 @@ class SelfdriveD:
     self.sensor_packets = ["accelerometer", "gyroscope"]
     self.camera_packets = ["roadCameraState", "driverCameraState", "wideRoadCameraState"]
 
+    self.disable_dm = self.params.get_int("DisableDM")
+
     # TODO: de-couple selfdrived with card/conflate on carState without introducing controls mismatches
     self.car_state_sock = messaging.sub_sock('carState', timeout=20)
 
     ignore = self.sensor_packets + self.gps_packets + ['alertDebug']
     if SIMULATION:
       ignore += ['driverCameraState', 'managerState']
+    elif self.disable_dm > 0:
+      self.camera_packets.remove("driverCameraState")
+    ignore += ['driverMonitoringState']
+
     if REPLAY:
       # no vipc in replay will make them ignored anyways
       ignore += ['roadCameraState', 'wideRoadCameraState']
     self.sm = messaging.SubMaster(['deviceState', 'pandaStates', 'peripheralState', 'modelV2', 'liveCalibration',
-                                   'carOutput', 'driverMonitoringState', 'longitudinalPlan', 'liveLocationKalman',
+                                   'carOutput', 'driverMonitoringState', 'longitudinalPlan', 'liveLocationKalman', # 'liveDelay',
                                    'managerState', 'liveParameters', 'radarState', 'liveTorqueParameters',
                                    'carrotMan',
                                    'controlsState', 'carControl', 'driverAssistance', 'alertDebug'] + \
                                    self.camera_packets + self.sensor_packets + self.gps_packets,
-                                  ignore_alive=ignore, ignore_avg_freq=ignore+['radarState',],
+                                  ignore_alive=ignore, ignore_avg_freq=ignore,
                                   ignore_valid=ignore, frequency=int(1/DT_CTRL))
 
     # read params
@@ -90,8 +97,8 @@ class SelfdriveD:
     car_recognized = self.CP.brand != 'mock'
 
     # cleanup old params
-    if not self.CP.experimentalLongitudinalAvailable:
-      self.params.remove("ExperimentalLongitudinalEnabled")
+    if not self.CP.alphaLongitudinalAvailable:
+      self.params.remove("AlphaLongitudinalEnabled")
     if not self.CP.openpilotLongitudinalControl:
       self.params.remove("ExperimentalMode")
 
@@ -115,8 +122,15 @@ class SelfdriveD:
     self.recalibrating_seen = False
     self.state_machine = StateMachine()
     self.rk = Ratekeeper(100, print_delay_threshold=None)
-
+    
     self.atc_type_last = ""
+
+
+    # some comma three with NVMe experience NVMe dropouts mid-drive that
+    # cause loggerd to crash on write, so ignore it only on that platform
+    self.ignored_processes = set()
+    if HARDWARE.get_device_type() == 'tici' and os.path.exists('/dev/nvme0'):
+      self.ignored_processes = {'loggerd', }
 
     # Determine startup event
     self.startup_event = EventName.startup if build_metadata.openpilot.comma_remote and build_metadata.tested_channel else EventName.startupMaster
@@ -279,7 +293,7 @@ class SelfdriveD:
       if not_running != self.not_running_prev:
         cloudlog.event("process_not_running", not_running=not_running, error=True)
       self.not_running_prev = not_running
-    if self.sm.recv_frame['managerState'] and not_running:
+    if self.sm.recv_frame['managerState'] and (not_running - self.ignored_processes):
       self.events.add(EventName.processNotRunning)
     else:
       if not SIMULATION and not self.rk.lagging:
@@ -289,8 +303,13 @@ class SelfdriveD:
           self.events.add(EventName.cameraFrameRate)
     if not REPLAY and self.rk.lagging:
       self.events.add(EventName.selfdrivedLagging)
-    if len(self.sm['radarState'].radarErrors) or ((not self.rk.lagging or REPLAY) and not self.sm.all_checks(['radarState'])):
-      self.events.add(EventName.radarFault)
+    if not self.sm.valid['radarState']:
+      if self.sm['radarState'].radarErrors.canError:
+        self.events.add(EventName.canError)
+      elif self.sm['radarState'].radarErrors.radarUnavailableTemporary:
+        self.events.add(EventName.radarTempUnavailable)
+      else:
+        self.events.add(EventName.radarFault)
     if not self.sm.valid['pandaStates']:
       self.events.add(EventName.usbError)
     if CS.canTimeout:
@@ -348,13 +367,13 @@ class SelfdriveD:
     controlstate = self.sm['controlsState']
     lac = getattr(controlstate.lateralControlState, controlstate.lateralControlState.which())
     if lac.active and not recent_steer_pressed and not self.CP.notCar:
-      clipped_speed = max(CS.vEgo, MIN_LATERAL_CONTROL_SPEED)
+      clipped_speed = max(CS.vEgo, 0.3)
       actual_lateral_accel = controlstate.curvature * (clipped_speed**2)
-      desired_lateral_accel = controlstate.desiredCurvature * (clipped_speed**2)
+      desired_lateral_accel = self.sm['modelV2'].action.desiredCurvature * (clipped_speed**2)
       undershooting = abs(desired_lateral_accel) / abs(1e-3 + actual_lateral_accel) > 1.2
       turning = abs(desired_lateral_accel) > 1.0
-      good_speed = CS.vEgo > 5
-      if undershooting and turning and good_speed and lac.saturated:
+      # TODO: lac.saturated includes speed and other checks, should be pulled out
+      if undershooting and turning and lac.saturated:
         self.events.add(EventName.steerSaturated)
 
     # Check for FCW
@@ -370,14 +389,15 @@ class SelfdriveD:
       gps_ok = self.sm.recv_frame[self.gps_location_service] > 0 and (self.sm.frame - self.sm.recv_frame[self.gps_location_service]) * DT_CTRL < 2.0
       if not gps_ok and self.sm['liveLocationKalman'].inputsOK and (self.distance_traveled > 1500):
         if self.distance_traveled < 1600:
-          pass #self.events.add(EventName.noGps)
+          self.events.add(EventName.noGps)
       #if gps_ok:
       #  self.distance_traveled = 0
       self.distance_traveled += abs(CS.vEgo) * DT_CTRL
 
       if self.sm['modelV2'].frameDropPerc > 20:
         self.events.add(EventName.modeldLagging)
-
+    if self.sm.frame == 550 and Params().get("NNFFModelName", encoding='utf-8') is not None:
+      self.events.add(EventName.torqueNNLoad)
     # decrement personality on distance button press
     #if self.CP.openpilotLongitudinalControl:
     #  if any(not be.pressed and be.type == ButtonType.gapAdjustCruise for be in CS.buttonEvents):

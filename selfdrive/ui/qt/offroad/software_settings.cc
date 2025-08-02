@@ -29,12 +29,6 @@ SoftwarePanel::SoftwarePanel(QWidget* parent) : ListWidget(parent) {
   versionLbl = new LabelControl(tr("Current Version"), "");
   addItem(versionLbl);
 
-  //online update switch
-  updateToggle = new ParamControl("DisableUpdates", tr("Disable Updates"), "", "");
-  QObject::connect(updateToggle, &ParamControl::toggleFlipped, [=](bool state) {
-  });
-  addItem(updateToggle);
-
   // download update btn
   downloadBtn = new ButtonControl(tr("Download"), tr("CHECK"));
   connect(downloadBtn, &ButtonControl::clicked, [=]() {
@@ -60,7 +54,7 @@ SoftwarePanel::SoftwarePanel(QWidget* parent) : ListWidget(parent) {
   connect(targetBranchBtn, &ButtonControl::clicked, [=]() {
     auto current = params.get("GitBranch");
     QStringList branches = QString::fromStdString(params.get("UpdaterAvailableBranches")).split(",");
-    for (QString b : {current.c_str(), "devel-staging", "devel", "nightly", "nightly-dev", "master-ci", "master"}) {
+    for (QString b : {current.c_str(), "devel-staging", "devel", "nightly", "nightly-dev", "master"}) {
       auto i = branches.indexOf(b);
       if (i >= 0) {
         branches.removeAt(i);

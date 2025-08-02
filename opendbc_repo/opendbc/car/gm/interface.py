@@ -3,13 +3,14 @@ import json
 import os
 from cereal import car
 from math import fabs, exp
-from panda import Panda
 from openpilot.common.params import Params
 from opendbc.car import get_safety_config, get_friction, structs
 from opendbc.car.common.basedir import BASEDIR
 from opendbc.car.common.conversions import Conversions as CV
-from opendbc.car.gm.radar_interface import RADAR_HEADER_MSG
-from opendbc.car.gm.values import CAR, CarControllerParams, EV_CAR, CAMERA_ACC_CAR, CanBus, GMFlags, CC_ONLY_CAR, SDGM_CAR, CruiseButtons
+from opendbc.car.gm.carcontroller import CarController
+from opendbc.car.gm.carstate import CarState
+from opendbc.car.gm.radar_interface import RadarInterface, RADAR_HEADER_MSG
+from opendbc.car.gm.values import CAR, CarControllerParams, EV_CAR, CAMERA_ACC_CAR, CanBus, GMFlags, CC_ONLY_CAR, SDGM_CAR, CruiseButtons, GMSafetyFlags, ALT_ACCS
 from opendbc.car.interfaces import CarInterfaceBase, TorqueFromLateralAccelCallbackType, FRICTION_THRESHOLD, LatControlInputs, NanoFFModel
 
 #ButtonType = structs.CarState.ButtonEvent.Type 이 두 줄도 사용되지 않습니다.
@@ -34,6 +35,10 @@ NEURAL_PARAMS_PATH = os.path.join(BASEDIR, 'torque_data/neural_ff_weights.json')
 PEDAL_MSG = 0x201
 
 class CarInterface(CarInterfaceBase):
+  CarState = CarState
+  CarController = CarController
+  RadarInterface = RadarInterface
+
   @staticmethod
   def get_pid_accel_limits(CP, current_speed, cruise_speed):
     return CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX
@@ -93,7 +98,7 @@ class CarInterface(CarInterfaceBase):
       return self.torque_from_lateral_accel_linear
 
   @staticmethod
-  def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, experimental_long, docs) -> structs.CarParams:
+  def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, docs) -> structs.CarParams:
     ret.brand = "gm"
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.gm)]
     ret.autoResumeSng = False
@@ -104,7 +109,7 @@ class CarInterface(CarInterfaceBase):
 
     if PEDAL_MSG in fingerprint[0]:
       ret.enableGasInterceptorDEPRECATED = True
-      ret.safetyConfigs[0].safetyParam |= Panda.FLAG_GM_GAS_INTERCEPTOR
+      ret.safetyConfigs[0].safetyParam |= GMSafetyFlags.GAS_INTERCEPTOR.value
 
     if candidate in EV_CAR:
       ret.transmissionType = TransmissionType.direct
@@ -114,37 +119,34 @@ class CarInterface(CarInterfaceBase):
     ret.longitudinalTuning.kpBP = [0.]
     ret.longitudinalTuning.kiBP = [0.]
 
-    if candidate in CAMERA_ACC_CAR:
-      ret.experimentalLongitudinalAvailable = True
+    if candidate in (CAMERA_ACC_CAR | SDGM_CAR):
+      ret.alphaLongitudinalAvailable = candidate not in (CC_ONLY_CAR | SDGM_CAR)
       ret.networkLocation = NetworkLocation.fwdCamera
       ret.radarUnavailable = True  # no radar
       ret.pcmCruise = True
-      ret.safetyConfigs[0].safetyParam |= Panda.FLAG_GM_HW_CAM
-      ret.minEnableSpeed = 5 * CV.KPH_TO_MS
+      ret.safetyConfigs[0].safetyParam |= GMSafetyFlags.HW_CAM.value
+      ret.minEnableSpeed = -1 * CV.KPH_TO_MS
       ret.minSteerSpeed = 10 * CV.KPH_TO_MS
 
       # Tuning for experimental long
       ret.longitudinalTuning.kpV = [1.0]
       ret.longitudinalTuning.kiV = [1.0]
       ret.stoppingDecelRate = 2.0  # reach brake quickly after enabling
+      ret.vEgoStopping = 0.25
+      ret.vEgoStarting = 0.25
       ret.stopAccel = -0.4
-      #ret.startingState = True
+      ret.startingState = True
       ret.startAccel = 1.5
 
-      if experimental_long:
+      if alpha_long:
         ret.pcmCruise = False
         ret.openpilotLongitudinalControl = True
-        ret.safetyConfigs[0].safetyParam |= Panda.FLAG_GM_HW_CAM_LONG
+        ret.safetyConfigs[0].safetyParam |= GMSafetyFlags.HW_CAM_LONG.value
 
-    elif candidate in SDGM_CAR:
-      ret.longitudinalTuning.kiV = [0., 0.]  # TODO: tuning
-      ret.experimentalLongitudinalAvailable = False
-      ret.networkLocation = NetworkLocation.fwdCamera
-      ret.pcmCruise = True
-      ret.radarUnavailable = True
-      ret.minEnableSpeed = -1.  # engage speed is decided by ASCM
-      ret.minSteerSpeed = 30 * CV.MPH_TO_MS
-      ret.safetyConfigs[0].safetyParam |= Panda.FLAG_GM_HW_SDGM
+      if candidate in ALT_ACCS:
+        ret.alphaLongitudinalAvailable = False
+        ret.openpilotLongitudinalControl = False
+        ret.minEnableSpeed = -1.  # engage speed is decided by PCM
 
     else:  # ASCM, OBD-II harness
       ret.openpilotLongitudinalControl = True
@@ -162,7 +164,7 @@ class CarInterface(CarInterfaceBase):
       # TODO: Test for CADILLAC_CT6_ACC
       if ret.enableGasInterceptorDEPRECATED:
         # Need to set ASCM long limits when using pedal interceptor, instead of camera ACC long limits
-        ret.safetyConfigs[0].safetyParam |= Panda.FLAG_GM_HW_ASCM_LONG
+        ret.safetyConfigs[0].safetyParam |= GMSafetyFlags.HW_ASCM_LONG.value
 
     # These cars have been put into dashcam only due to both a lack of users and test coverage.
     # These cars likely still work fine. Once a user confirms each car works and a test route is
@@ -181,19 +183,21 @@ class CarInterface(CarInterfaceBase):
       ret.longitudinalTuning.kpBP = [0.]
       ret.longitudinalTuning.kpV = [1.0]
       ret.longitudinalTuning.kiBP = [0.]
-      ret.longitudinalTuning.kiV = [.3]
+      ret.longitudinalTuning.kiV = [.35]
       ret.longitudinalTuning.kf = 1.0
       ret.stoppingDecelRate = 0.2 # brake_travel/s while trying to stop
+      ret.vEgoStopping = 0.1
+      ret.vEgoStarting = 0.05
       ret.stopAccel = -0.5
       ret.startingState = True
-      ret.startAccel = 1.5
+      ret.startAccel = 1.9
 
       # softer long tune for ev table
       if useEVTables:
         ret.longitudinalTuning.kpBP = [0.]
         ret.longitudinalTuning.kpV = [1.0]
         ret.longitudinalTuning.kiBP = [0.]
-        ret.longitudinalTuning.kiV = [.05]
+        ret.longitudinalTuning.kiV = [.35]
         ret.longitudinalTuning.kf = 1.0
         ret.stoppingDecelRate = 1.0 # brake_travel/s while trying to stop
         ret.stopAccel = -0.5
@@ -291,9 +295,12 @@ class CarInterface(CarInterfaceBase):
 
     elif candidate == CAR.CADILLAC_XT4:
       ret.steerActuatorDelay = 0.2
+      ret.minEnableSpeed = -1.  # engage speed is decided by pcm
+      ret.minSteerSpeed = 30 * CV.MPH_TO_MS
       CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
     elif candidate == CAR.CHEVROLET_VOLT_2019:
       ret.steerActuatorDelay = 0.2
+      ret.minEnableSpeed = -1.  # engage speed is decided by pcm
       CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
 
     elif candidate == CAR.CADILLAC_XT5_CC:
@@ -302,25 +309,28 @@ class CarInterface(CarInterfaceBase):
 
     elif candidate == CAR.CHEVROLET_TRAVERSE:
       ret.steerActuatorDelay = 0.2
-      ret.minSteerSpeed = 10 * CV.KPH_TO_MS
+      ret.minEnableSpeed = -1.  # engage speed is decided by pcm
       CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
 
     elif candidate == CAR.BUICK_BABYENCLAVE:
       ret.steerActuatorDelay = 0.2
-      ret.minSteerSpeed = 10 * CV.KPH_TO_MS
+      ret.minEnableSpeed = -1.  # engage speed is decided by pcm
       CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
 
     elif candidate == CAR.CADILLAC_CT6_CC:
       CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
 
     elif candidate == CAR.CHEVROLET_MALIBU_CC:
-      ret.lateralTuning.pid.kiBP, ret.lateralTuning.pid.kpBP = [[0.], [0.]]
-      ret.lateralTuning.pid.kpV, ret.lateralTuning.pid.kiV = [[0.2], [0.00]]
-      ret.lateralTuning.pid.kf = 0.00004   # full torque for 20 deg at 80mph means 0.00007818594
+      ret.steerActuatorDelay = 0.2
+      CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
 
     elif candidate == CAR.CHEVROLET_TRAX:
       CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
       ret.stoppingDecelRate = 0.3
+      ret.minEnableSpeed = -1.
+      ret.stopAccel = -0.5
+      ret.startingState = True
+      ret.startAccel = 1.0
     elif candidate == CAR.CHEVROLET_TRAVERSE:
       ret.steerActuatorDelay = 0.2
       CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
@@ -332,7 +342,7 @@ class CarInterface(CarInterfaceBase):
 
     if ret.enableGasInterceptorDEPRECATED:
       ret.networkLocation = NetworkLocation.fwdCamera
-      ret.safetyConfigs[0].safetyParam |= Panda.FLAG_GM_HW_CAM
+      ret.safetyConfigs[0].safetyParam |= GMSafetyFlags.HW_CAM.value
       ret.minEnableSpeed = -1
       ret.pcmCruise = False
       ret.openpilotLongitudinalControl = True
@@ -340,7 +350,7 @@ class CarInterface(CarInterfaceBase):
 
       if candidate in CC_ONLY_CAR:
         ret.flags |= GMFlags.PEDAL_LONG.value
-        ret.safetyConfigs[0].safetyParam |= Panda.FLAG_GM_PEDAL_LONG
+        ret.safetyConfigs[0].safetyParam |= GMSafetyFlags.PEDAL_LONG.value
         # Note: Low speed, stop and go not tested. Should be fairly smooth on highway
         ret.longitudinalTuning.kpBP = [0., 3., 6., 35.]
         ret.longitudinalTuning.kpV = [0.08, 0.175, 0.225, 0.33]
@@ -349,19 +359,19 @@ class CarInterface(CarInterfaceBase):
         ret.longitudinalTuning.kf = 0.25
         ret.stoppingDecelRate = 0.8
       else:  # Pedal used for SNG, ACC for longitudinal control otherwise
-        ret.safetyConfigs[0].safetyParam |= Panda.FLAG_GM_HW_CAM_LONG
+        ret.safetyConfigs[0].safetyParam |= GMSafetyFlags.HW_CAM_LONG.value
         ret.startingState = True
         ret.vEgoStopping = 0.25
         ret.vEgoStarting = 0.25
 
     elif candidate in CC_ONLY_CAR:
       ret.flags |= GMFlags.CC_LONG.value
-      ret.safetyConfigs[0].safetyParam |= Panda.FLAG_GM_CC_LONG
-      if experimental_long:
+      ret.safetyConfigs[0].safetyParam |= GMSafetyFlags.CC_LONG.value
+      if alpha_long:
         ret.openpilotLongitudinalControl = True
         ret.flags |= GMFlags.CC_LONG.value
       ret.radarUnavailable = True
-      ret.experimentalLongitudinalAvailable = True
+      ret.alphaLongitudinalAvailable = True
       ret.minEnableSpeed = 24 * CV.MPH_TO_MS
       ret.pcmCruise = True
 
@@ -371,13 +381,13 @@ class CarInterface(CarInterfaceBase):
       ret.longitudinalTuning.kiV = [0., 20., 20.]  # set lower end to 0 since we can't drive below that speed
 
     if candidate in CC_ONLY_CAR:
-      ret.safetyConfigs[0].safetyParam |= Panda.FLAG_GM_NO_ACC
+      ret.safetyConfigs[0].safetyParam |= GMSafetyFlags.NO_ACC.value
 
     # Exception for flashed cars, or cars whose camera was removed
     if (ret.networkLocation == NetworkLocation.fwdCamera or candidate in CC_ONLY_CAR) and CAM_MSG not in fingerprint[
       CanBus.CAMERA] and not candidate in SDGM_CAR:
       ret.flags |= GMFlags.NO_CAMERA.value
-      ret.safetyConfigs[0].safetyParam |= Panda.FLAG_GM_NO_CAMERA
+      ret.safetyConfigs[0].safetyParam |= GMSafetyFlags.NO_CAMERA.value
 
     if ACCELERATOR_POS_MSG not in fingerprint[CanBus.POWERTRAIN]:
       ret.flags |= GMFlags.NO_ACCELERATOR_POS_MSG.value

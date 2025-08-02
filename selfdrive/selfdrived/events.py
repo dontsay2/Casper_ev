@@ -9,6 +9,7 @@ from cereal import log, car
 import cereal.messaging as messaging
 from openpilot.common.conversions import Conversions as CV
 from openpilot.common.git import get_short_branch
+from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.locationd.calibrationd import MIN_SPEED_FILTER
 
@@ -251,6 +252,20 @@ def calibration_incomplete_alert(CP: car.CarParams, CS: car.CarState, sm: messag
     AlertStatus.normal, AlertSize.mid,
     Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .2)
 
+def torque_nn_load_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
+  model_name = Params().get("NNFFModelName", encoding='utf-8')
+  if model_name == "":
+    return Alert(
+      "NNFF Torque Controller not available",
+      "Donate logs to Twilsonco to get it added!",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 6.0)
+  else:
+    return Alert(
+      "NNFF Torque Controller loaded",
+      model_name,
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 5.0)
 
 # *** debug alerts ***
 
@@ -292,6 +307,24 @@ def calibration_invalid_alert(CP: car.CarParams, CS: car.CarState, sm: messaging
   return NormalPermanentAlert("Calibration Invalid", angles)
 
 
+def paramsd_invalid_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
+  if not sm['liveParameters'].angleOffsetValid:
+    angle_offset_deg = sm['liveParameters'].angleOffsetDeg
+    title = "Steering misalignment detected"
+    text = f"Angle offset too high (Offset: {angle_offset_deg:.1f}°)"
+  elif not sm['liveParameters'].steerRatioValid:
+    steer_ratio = sm['liveParameters'].steerRatio
+    title = "Steer ratio mismatch"
+    text = f"Steering rack geometry may be off (Ratio: {steer_ratio:.1f})"
+  elif not sm['liveParameters'].stiffnessFactorValid:
+    stiffness_factor = sm['liveParameters'].stiffnessFactor
+    title = "Abnormal tire stiffness"
+    text = f"Check tires, pressure, or alignment (Factor: {stiffness_factor:.1f})"
+  else:
+    return NoEntryAlert("paramsd Temporary Error")
+
+  return NoEntryAlert(alert_text_1=title, alert_text_2=text)
+
 def overheat_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
   cpu = max(sm['deviceState'].cpuTempC, default=0.)
   gpu = max(sm['deviceState'].gpuTempC, default=0.)
@@ -321,7 +354,7 @@ def wrong_car_mode_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubM
 
 def joystick_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
   gb = sm['carControl'].actuators.accel / 4.
-  steer = sm['carControl'].actuators.steer
+  steer = sm['carControl'].actuators.torque
   vals = f"Gas: {round(gb * 100.)}%, Steer: {round(steer * 100.)}%"
   return NormalPermanentAlert("Joystick Mode", vals)
 
@@ -340,7 +373,16 @@ def personality_changed_alert(CP: car.CarParams, CS: car.CarState, sm: messaging
   personality = str(personality).title()
   return NormalPermanentAlert(f"Driving Personality: {personality}", duration=1.5)
 
-
+def car_parser_result(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
+  results = Params().get("CanParserResult")
+  if results is None:
+    results = ""
+  return Alert(
+    "CAN Error: Check Connections!!",
+    results,
+    AlertStatus.normal, AlertSize.small,
+    Priority.LOW, VisualAlert.none, AudibleAlert.none, 1., creation_delay=1.)
+  
 
 EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # ********** events with no alerts **********
@@ -417,7 +459,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "BRAKE!",
       "Emergency Braking: Risk of Collision",
       AlertStatus.critical, AlertSize.full,
-      Priority.HIGHEST, VisualAlert.fcw, AudibleAlert.none, 2.),
+      Priority.HIGHEST, VisualAlert.fcw, AudibleAlert.stopStop, 2.),
     ET.NO_ENTRY: NoEntryAlert("AEB: Risk of Collision"),
   },
 
@@ -426,7 +468,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "BRAKE!",
       "Stock AEB: Risk of Collision",
       AlertStatus.critical, AlertSize.full,
-      Priority.HIGHEST, VisualAlert.fcw, AudibleAlert.none, 2.),
+      Priority.HIGHEST, VisualAlert.fcw, AudibleAlert.stopStop, 2.),
     ET.NO_ENTRY: NoEntryAlert("Stock AEB: Risk of Collision"),
   },
 
@@ -435,7 +477,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "BRAKE!",
       "Risk of Collision",
       AlertStatus.critical, AlertSize.full,
-      Priority.HIGHEST, VisualAlert.fcw, AudibleAlert.warningSoft, 2.),
+      Priority.HIGHEST, VisualAlert.fcw, AudibleAlert.stopStop, 2.),
   },
 
   EventName.ldw: {
@@ -604,7 +646,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # This alert is thrown when any of these values exceed a sanity check. This can be caused by
   # bad alignment or bad sensor data. If this happens consistently consider creating an issue on GitHub
   EventName.paramsdTemporaryError: {
-    ET.NO_ENTRY: NoEntryAlert("paramsd Temporary Error"),
+    ET.NO_ENTRY: paramsd_invalid_alert,
     ET.SOFT_DISABLE: soft_disable_alert("paramsd Temporary Error"),
   },
 
@@ -815,6 +857,11 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.NO_ENTRY: NoEntryAlert("Radar Error: Restart the Car"),
   },
 
+  EventName.radarTempUnavailable: {
+    ET.SOFT_DISABLE: soft_disable_alert("Radar Temporarily Unavailable"),
+    ET.NO_ENTRY: NoEntryAlert("Radar Temporarily Unavailable"),
+  },
+
   # Every frame from the camera should be processed by the model. If modeld
   # is not processing frames fast enough they have to be dropped. This alert is
   # thrown when over 20% of frames are dropped.
@@ -876,28 +923,30 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # - CAN data is received, but some message are not received at the right frequency
   # If you're not writing a new car port, this is usually cause by faulty wiring
   EventName.canError: {
+    ET.PERMANENT: car_parser_result,
     ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("CAN Error"),
-    ET.PERMANENT: Alert(
-      "CAN Error: Check Connections",
-      "",
-      AlertStatus.normal, AlertSize.small,
-      Priority.LOW, VisualAlert.none, AudibleAlert.none, 1., creation_delay=1.),
+    #ET.PERMANENT: Alert(
+    #  "CAN Error: Check Connections",
+    #  "",
+    #  AlertStatus.normal, AlertSize.small,
+    #  Priority.LOW, VisualAlert.none, AudibleAlert.none, 1., creation_delay=1.),
     ET.NO_ENTRY: NoEntryAlert("CAN Error: Check Connections"),
   },
 
   EventName.canBusMissing: {
+    ET.PERMANENT: car_parser_result,
     ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("CAN Bus Disconnected"),
-    ET.PERMANENT: Alert(
-      "CAN Bus Disconnected: Likely Faulty Cable",
-      "",
-      AlertStatus.normal, AlertSize.small,
-      Priority.LOW, VisualAlert.none, AudibleAlert.none, 1., creation_delay=1.),
+    #ET.PERMANENT: Alert(
+    #  "CAN Bus Disconnected: Likely Faulty Cable",
+    #  "",
+    #  AlertStatus.normal, AlertSize.small,
+    #  Priority.LOW, VisualAlert.none, AudibleAlert.none, 1., creation_delay=1.),
     ET.NO_ENTRY: NoEntryAlert("CAN Bus Disconnected: Check Connections"),
   },
 
   EventName.steerUnavailable: {
     ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("LKAS Fault: Restart the Car"),
-    ET.PERMANENT: NormalPermanentAlert("LKAS Fault: Restart the car to engage"),
+    ET.PERMANENT: ImmediateDisableAlert("LKAS Fault: Restart the car to engage"),
     ET.NO_ENTRY: NoEntryAlert("LKAS Fault: Restart the Car"),
   },
 
@@ -905,9 +954,9 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: Alert(
       "Reverse\nGear",
       "",
-      AlertStatus.normal, AlertSize.full,
-      Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .2, creation_delay=0.5),
-    ET.USER_DISABLE: ImmediateDisableAlert("Reverse Gear"),
+      AlertStatus.normal, AlertSize.none,
+      Priority.LOWEST, VisualAlert.none, AudibleAlert.reverseGear, .2, creation_delay=0.5),
+    ET.SOFT_DISABLE: SoftDisableAlert("Reverse Gear"),
     ET.NO_ENTRY: NoEntryAlert("Reverse Gear"),
   },
 
@@ -957,7 +1006,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventName.softHold: {
     ET.WARNING: Alert(
-      "SoftHold active",
+      "SoftHold",
       "",
       AlertStatus.normal, AlertSize.small,
       Priority.LOW, VisualAlert.none, AudibleAlert.none, .1),
@@ -1047,6 +1096,9 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
   EventName.audio0: {
      ET.WARNING: EngagementAlert(AudibleAlert.longDisengaged),
+  },
+  EventName.torqueNNLoad: {
+    ET.PERMANENT: torque_nn_load_alert,
   },
 
 }

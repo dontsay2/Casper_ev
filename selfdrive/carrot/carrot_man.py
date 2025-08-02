@@ -16,9 +16,10 @@ from cereal import log
 import cereal.messaging as messaging
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.params import Params
-from openpilot.common.filter_simple import StreamingMovingAverage
+from openpilot.common.filter_simple import MyMovingAverage
 from openpilot.system.hardware import PC, TICI
 from openpilot.selfdrive.navd.helpers import Coordinate
+from opendbc.car.common.conversions import Conversions as CV
 
 try:
   from shapely.geometry import LineString
@@ -27,6 +28,62 @@ except ImportError:
   SHAPELY_AVAILABLE = False
 
 NetworkType = log.DeviceState.NetworkType
+
+nav_type_mapping = {
+  12: ("turn", "left", 1),
+  16: ("turn", "sharp left", 1),
+  1000: ("turn", "slight left", 1),
+  1001: ("turn", "slight right", 2),
+  1002: ("fork", "slight left", 3),
+  1003: ("fork", "slight right", 4),
+  1006: ("off ramp", "left", 3),
+  1007: ("off ramp", "right", 4),
+  13: ("turn", "right", 2),
+  19: ("turn", "sharp right", 2),
+  102: ("off ramp", "slight left", 3),
+  105: ("off ramp", "slight left", 3),
+  112: ("off ramp", "slight left", 3),
+  115: ("off ramp", "slight left", 3),
+  101: ("off ramp", "slight right", 4),
+  104: ("off ramp", "slight right", 4),
+  111: ("off ramp", "slight right", 4),
+  114: ("off ramp", "slight right", 4),
+  7: ("fork", "left", 3),
+  44: ("fork", "left", 3),
+  17: ("fork", "left", 3),
+  75: ("fork", "left", 3),
+  76: ("fork", "left", 3),
+  118: ("fork", "left", 3),
+  6: ("fork", "right", 4),
+  43: ("fork", "right", 4),
+  73: ("fork", "right", 4),
+  74: ("fork", "right", 4),
+  123: ("fork", "right", 4),
+  124: ("fork", "right", 4),
+  117: ("fork", "right", 4),
+  131: ("rotary", "slight right", 5),
+  132: ("rotary", "slight right", 5),
+  140: ("rotary", "slight left", 5),
+  141: ("rotary", "slight left", 5),
+  133: ("rotary", "right", 5),
+  134: ("rotary", "sharp right", 5),
+  135: ("rotary", "sharp right", 5),
+  136: ("rotary", "sharp left", 5),
+  137: ("rotary", "sharp left", 5),
+  138: ("rotary", "sharp left", 5),
+  139: ("rotary", "left", 5),
+  142: ("rotary", "straight", 5),
+  14: ("turn", "uturn", 5),
+  201: ("arrive", "straight", 5),
+  51: ("notification", "straight", None),
+  52: ("notification", "straight", None),
+  53: ("notification", "straight", None),
+  54: ("notification", "straight", None),
+  55: ("notification", "straight", None),
+  153: ("", "", 6),  #TG
+  154: ("", "", 6),  #TG
+  249: ("", "", 6)   #TG
+}
 
 ################ CarrotNavi
 ## 국가법령정보센터: 도로설계기준
@@ -179,10 +236,11 @@ def calculate_curvature(p1, p2, p3):
 
 class CarrotMan:
   def __init__(self):
+    print("************************************************CarrotMan init************************************************")
     self.params = Params()
     self.params_memory = Params("/dev/shm/params")
-    self.sm = messaging.SubMaster(['deviceState', 'carState', 'controlsState', 'longitudinalPlan', 'modelV2', 'selfdriveState', 'carControl'])
-    self.pm = messaging.PubMaster(['carrotMan', "navRoute", "navInstruction"])
+    self.sm = messaging.SubMaster(['deviceState', 'carState', 'controlsState', 'longitudinalPlan', 'modelV2', 'selfdriveState', 'carControl', 'navRouteNavd', 'liveLocationKalman', 'navInstruction'])
+    self.pm = messaging.PubMaster(['carrotMan', "navRoute", "navInstructionCarrot"])
 
     self.carrot_serv = CarrotServ()
 
@@ -196,7 +254,7 @@ class CarrotMan:
     self.remote_addr = None
 
     self.turn_speed_last = 250
-    self.curvatureFilter = StreamingMovingAverage(20)
+    self.curvatureFilter = MyMovingAverage(20)
     self.carrot_curve_speed_params()
 
     self.carrot_zmq_thread = threading.Thread(target=self.carrot_cmd_zmq, args=[])
@@ -217,8 +275,11 @@ class CarrotMan:
     self.navi_points = []
     self.navi_points_start_index = 0
     self.navi_points_active = False
+    self.navd_active = False
 
     self.active_carrot_last = False
+
+    self.is_metric = self.params.get_bool("IsMetric")
 
   def get_broadcast_address(self):
     if PC:
@@ -257,6 +318,8 @@ class CarrotMan:
     while self.is_running:
       try:
         self.sm.update(0)
+        if self.sm.updated['navRouteNavd']:
+          self.send_routes(self.sm['navRouteNavd'].coordinates, True)
         remote_addr = self.remote_addr
         remote_ip = remote_addr[0] if remote_addr is not None else ""
         vturn_speed = self.carrot_curve_speed(self.sm)
@@ -290,8 +353,10 @@ class CarrotMan:
 
             if remote_addr is None:
               print(f"Broadcasting: {self.broadcast_ip}:{msg}")
-              self.navi_points = []
-              self.navi_points_active = False
+              if not self.navd_active:
+                #print("clear path_points: navd_active: ", self.navd_active)
+                self.navi_points = []
+                self.navi_points_active = False
 
           except Exception as e:
             if self.connection:
@@ -309,14 +374,21 @@ class CarrotMan:
 
   def carrot_navi_route(self):
 
-    if not self.navi_points_active or not SHAPELY_AVAILABLE or self.carrot_serv.active_carrot <= 1:
-      #print(f"navi_points_active: {self.navi_points_active}, active_carrot: {self.carrot_serv.active_carrot}")
-      #haversine_cache.clear()
-      #curvature_cache.clear()
-      self.navi_points = []
-      self.navi_points_active = False
-      if self.active_carrot_last > 1:
+    if self.carrot_serv.active_carrot > 1:
+      if self.navd_active:
+        self.navd_active = False
         self.params.remove("NavDestination")
+    if not self.navi_points_active or not SHAPELY_AVAILABLE or (self.carrot_serv.active_carrot <= 1 and not self.navd_active):
+      #print(f"navi_points_active: {self.navi_points_active}, active_carrot: {self.carrot_serv.active_carrot}")
+      if self.navi_points_active:
+        print("navi_points_active: ", self.navi_points_active, "active_carrot: ", self.carrot_serv.active_carrot, "navd_active: ", self.navd_active)
+        #haversine_cache.clear()
+        #curvature_cache.clear()
+        self.navi_points = []
+        self.navi_points_active = False
+        if self.active_carrot_last > 1:
+          #self.params.remove("NavDestination")
+          pass
       self.active_carrot_last = self.carrot_serv.active_carrot
       return [],[],300
 
@@ -358,9 +430,10 @@ class CarrotMan:
                   speed = max(speed, self.carrot_serv.nRoadLimitSpeed)
                 speeds.append(speed)
                 distances.append(distance)
-
+            #print(f"curvatures= {[round(s, 4) for s in curvatures]}")
+            #print(f"speeds= {[round(s, 1) for s in speeds]}")
             # Apply acceleration limits in reverse to adjust speeds
-            accel_limit = self.carrot_serv.autoNaviSpeedDecelRate * 0.9 # m/s^2, 설정된값의 90%를 사용하여, 좀더 낮은속도로 진입하도록 유도
+            accel_limit = self.carrot_serv.autoNaviSpeedDecelRate # m/s^2
             accel_limit_kmh = accel_limit * 3.6  # Convert to km/h per second
             out_speeds = [0] * len(speeds)
             out_speeds[-1] = speeds[-1]  # Set the last speed as the initial value
@@ -393,12 +466,14 @@ class CarrotMan:
             #distance_advance = self.sm['carState'].vEgo * 3.0  # Advance distance by 3.0 seconds
             #out_speed = interp(distance_advance, distances, out_speeds)
             out_speed = out_speeds[0]
+            #print(f"out_speeds= {[round(s, 1) for s in out_speeds]}")
     else:
         resampled_points = []
+        resampled_distances = []
         curvatures = []
         speeds = []
         distances = []
-        self.params.remove("NavDestination")
+        #self.params.remove("NavDestination")
 
     return resampled_points, resampled_distances, out_speed #speeds, distances
 
@@ -508,6 +583,81 @@ class CarrotMan:
           time.sleep(1)
       except Exception as e:
         self.remote_addr = None
+        print(f"Network error, retrying...: {e}")
+        time.sleep(2)
+
+
+  def parse_kisa_data(self, data: bytes):
+    result = {}
+    
+    try:
+      decoded = data.decode('utf-8')
+    except UnicodeDecodeError:
+      print("Decoding error:", data)
+      return result
+
+    parts = decoded.split('/')
+    for part in parts:
+      if ':' in part:
+        key, value = part.split(':', 1)
+        try:
+          result[key] = int(value)
+        except ValueError:
+          result[key] = value
+    return result
+  
+  def kisa_app_thread(self):
+    while True:
+      try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+          sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+          sock.settimeout(10)  # 소켓 타임아웃 설정 (10초)
+          sock.bind(('', 12345))  # UDP 포트 바인딩
+          print("#########kisa_app_thread: UDP thread started...")
+
+          while True:
+            try:
+              #self.remote_addr = None
+              # 데이터 수신 (UDP는 recvfrom 사용)
+              try:
+                data, remote_addr = sock.recvfrom(4096)  # 최대 4096 바이트 수신
+                #print(f"Received data from {self.remote_addr}")
+
+                if not data:
+                  raise ConnectionError("No data received")
+
+                #if self.remote_addr is None:
+                #  print("Connected to: ", remote_addr)
+                #self.remote_addr = remote_addr
+                try:
+                  print(data)
+                  kisa_data = self.parse_kisa_data(data)
+                  self.carrot_serv.update_kisa(kisa_data)
+                  #json_obj = json.loads(data.decode())
+                  #print(json_obj)
+                except Exception as e:
+                  traceback.print_exc()
+                  print(f"kisa_app_thread: json error...: {e}")
+                  print(data)
+
+              except TimeoutError:
+                print("Waiting for data (timeout)...")
+                #self.remote_addr = None
+                time.sleep(1)
+
+              except Exception as e:
+                print(f"kisa_app_thread: error...: {e}")
+                #self.remote_addr = None
+                break
+
+            except Exception as e:
+              print(f"kisa_app_thread: recv error...: {e}")
+              #self.remote_addr = None
+              break
+
+          time.sleep(1)
+      except Exception as e:
+        #self.remote_addr = None
         print(f"Network error, retrying...: {e}")
         time.sleep(2)
 
@@ -632,14 +782,17 @@ class CarrotMan:
         elif 'echo_cmd' in json_obj:
           try:
             result = subprocess.run(json_obj['echo_cmd'], shell=True, capture_output=True, text=False)
+            exitStatus = result.returncode
             try:
               stdout = result.stdout.decode('utf-8')
+              stderr = result.stderr.decode('utf-8')
             except UnicodeDecodeError:
               stdout = result.stdout.decode('euc-kr', 'ignore')
+              stderr = result.stderr.decode('euc-kr', 'ignore')
 
-            echo = json.dumps({"echo_cmd": json_obj['echo_cmd'], "result": stdout})
+            echo = json.dumps({"echo_cmd": json_obj['echo_cmd'], "exitStatus": exitStatus, "result": stdout, "error": stderr})
           except Exception as e:
-            echo = json.dumps({"echo_cmd": json_obj['echo_cmd'], "result": f"exception error: {str(e)}"})
+            echo = json.dumps({"echo_cmd": json_obj['echo_cmd'], "exitStatus": exitStatus, "result": "", "error": f"exception error: {str(e)}"})
           #print(echo)
           socket.send(echo.encode())
         elif 'tmux_send' in json_obj:
@@ -650,11 +803,11 @@ class CarrotMan:
       except Exception as e:
         print(f"carrot_cmd_zmq error: {e}")
         socket.close()
-        time.sleep(1)
+        time.sleep(1) 
         socket, poller = setup_socket()
 
   def recvall(self, sock, n):
-    """重复接收数据,直到接收到n字节为止的函数"""
+    """n바이트를 수신할 때까지 반복적으로 데이터를 받는 함수"""
     data = bytearray()
     while len(data) < n:
       packet = sock.recv(n - len(data))
@@ -672,67 +825,104 @@ class CarrotMan:
     return struct.unpack('!f', float_data)[0]
 
 
+  def send_routes(self, coords, from_navd=False):
+    if from_navd:
+      if len(coords) > 0:
+        self.navi_points = [(c.longitude, c.latitude) for c in coords]
+        self.navi_points_start_index = 0
+        self.navi_points_active = True
+        print("Received points from navd:", len(self.navi_points))
+        self.navd_active = True
+
+        # 경로수신 -> carrotman active되고 약간의 시간지연이 발생함..
+        self.carrot_serv.active_count = 80
+        self.carrot_serv.active_sdi_count = self.carrot_serv.active_sdi_count_max
+        self.carrot_serv.active_carrot = 2
+
+        coords = [{"latitude": c.latitude, "longitude": c.longitude} for c in coords]
+        #print("navdNaviPoints=", self.navi_points)
+      else:
+        print("Received points from navd: 0")
+        self.navd_active = False
+
+    msg = messaging.new_message('navRoute', valid=True)
+    msg.navRoute.coordinates = coords
+    self.pm.send('navRoute', msg)
+
   def carrot_route(self):
     host = '0.0.0.0'  # 혹은 다른 호스트 주소
     port = 7709  # 포트 번호
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-      s.bind((host, port))
-      s.listen()
+    try:
+      with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, port))
+        s.listen()
 
-      while True:
-        print("################# waiting connection from CarrotMan route #####################")
-        conn, addr = s.accept()
-        with conn:
-          print(f"Connected by {addr}")
-          #self.clear_route()
+        while True:
+          print("################# waiting connection from CarrotMan route #####################")
+          conn, addr = s.accept()
+          with conn:
+            print(f"Connected by {addr}")
+            #self.clear_route()
 
-          # 전체 데이터 크기 수신
-          total_size_bytes = self.recvall(conn, 4)
-          if not total_size_bytes:
-            print("Connection closed or error occurred")
-            continue
-          try:
-            total_size = struct.unpack('!I', total_size_bytes)[0]
-            # 전체 데이터를 한 번에 수신
-            all_data = self.recvall(conn, total_size)
-            if all_data is None:
-                print("Connection closed or incomplete data received")
-                continue
+            # 전체 데이터 크기 수신
+            total_size_bytes = self.recvall(conn, 4)
+            if not total_size_bytes:
+              print("Connection closed or error occurred")
+              continue
+            try:
+              total_size = struct.unpack('!I', total_size_bytes)[0]
+              # 전체 데이터를 한 번에 수신
+              all_data = self.recvall(conn, total_size)
+              if all_data is None:
+                  print("Connection closed or incomplete data received")
+                  continue
 
-            self.navi_points = []
-            points = []
-            for i in range(0, len(all_data), 8):
-              x, y = struct.unpack('!ff', all_data[i:i+8])
-              self.navi_points.append((x, y))
-              coord = Coordinate.from_mapbox_tuple((x, y))
-              points.append(coord)
-            coords = [c.as_dict() for c in points]
-            self.navi_points_start_index = 0
-            self.navi_points_active = True
-            print("Received points:", len(self.navi_points))
-            #print("Received points:", self.navi_points)
+              self.navi_points = []
+              points = []
+              for i in range(0, len(all_data), 8):
+                x, y = struct.unpack('!ff', all_data[i:i+8])
+                self.navi_points.append((x, y))
+                coord = Coordinate.from_mapbox_tuple((x, y))
+                points.append(coord)
+              coords = [c.as_dict() for c in points]
+              self.navi_points_start_index = 0
+              self.navi_points_active = True
+              print("Received points:", len(self.navi_points))
+              #print("Received points:", self.navi_points)
 
-            msg = messaging.new_message('navRoute', valid=True)
-            msg.navRoute.coordinates = coords
-            self.pm.send('navRoute', msg)
-            #self.carrot_route_active = True
-            #self.params.put_bool_nonblocking("CarrotRouteActive", True)
+              self.send_routes(coords)
+              """
+              try:
+                module_name = "route_engine"
+                class_name = "RouteEngine"
+                moduel = importlib.import_module(module_name)
+                cls = getattr(moduel, class_name)
+                route_engine_instance = cls(name="Loaded at Runtime")
 
-            if len(coords):
-              dest = coords[-1]
-              dest['place_name'] = "External Navi"
-              self.params.put("NavDestination", json.dumps(dest))
+                route_engine_instance.send_route_coords(coords, True)
+              except Exception as e:
+                print(f"route_engine error: {e}")
 
-          except Exception as e:
-            print(e)
+              #msg = messaging.new_message('navRoute', valid=True)
+              #msg.navRoute.coordinates = coords
+              #self.pm.send('navRoute', msg)
+              """
 
+              if len(coords):
+                dest = coords[-1]
+                dest['place_name'] = "External Navi"
+                self.params.put("NavDestination", json.dumps(dest))
+
+            except Exception as e:
+              print(e)
+    except Exception as e:
+      print("################# CarrotMan route server error #####################")
+      print(e)
 
   def carrot_curve_speed_params(self):
-    self.autoCurveSpeedLowerLimit = int(self.params.get("AutoCurveSpeedLowerLimit"))
     self.autoCurveSpeedFactor = self.params.get_int("AutoCurveSpeedFactor")*0.01
     self.autoCurveSpeedAggressiveness = self.params.get_int("AutoCurveSpeedAggressiveness")*0.01
-    self.autoCurveSpeedFactorIn = self.autoCurveSpeedAggressiveness - 1.0
 
   def carrot_curve_speed(self, sm):
     self.carrot_curve_speed_params()
@@ -743,34 +933,6 @@ class CarrotMan:
         return 250
 
     return self.vturn_speed(sm['carState'], sm)
-
-    v_ego = sm['carState'].vEgo
-    # 회전속도를 선속도 나누면 : 곡률이 됨. [12:20]은 약 1.4~3.5초 앞의 곡률을 계산함.
-    orientationRates = np.array(sm['modelV2'].orientationRate.z, dtype=np.float32)
-    speed = min(self.turn_speed_last / 3.6, np.clip(v_ego, 0.5, 100.0))
-
-    # 절대값이 가장 큰 요소의 인덱스를 찾습니다.
-    max_index = np.argmax(np.abs(orientationRates[12:20]))
-    # 해당 인덱스의 실제 값을 가져옵니다.
-    max_orientation_rate = orientationRates[12 + max_index]
-    # 부호를 포함한 curvature를 계산합니다.
-    curvature = max_orientation_rate / speed
-
-    curvature = self.curvatureFilter.process(curvature) * self.autoCurveSpeedFactor
-    turn_speed = 250
-
-    if abs(curvature) > 0.0001:
-        # 곡률의 절대값을 사용하여 속도를 계산합니다.
-        base_speed = np.interp(abs(curvature), V_CURVE_LOOKUP_BP, V_CRUVE_LOOKUP_VALS)
-        base_speed = np.clip(base_speed, self.autoCurveSpeedLowerLimit, 255)
-        # 곡률의 부호를 적용하여 turn_speed의 부호를 결정합니다.
-        turn_speed = np.sign(curvature) * base_speed
-
-    self.turn_speed_last = abs(turn_speed)
-    speed_diff = max(0, v_ego * 3.6 - abs(turn_speed))
-    turn_speed = turn_speed - np.sign(curvature) * speed_diff * self.autoCurveSpeedFactorIn
-    #controls.debugText2 = 'CURVE={:5.1f},curvature={:5.4f},mode={:3.1f}'.format(self.turnSpeed_prev, curvature, self.drivingModeIndex)
-    return turn_speed
 
   def vturn_speed(self, CS, sm):
     TARGET_LAT_A = 1.9  # m/s^2
@@ -793,7 +955,8 @@ class CarrotMan:
     adjusted_target_lat_a = TARGET_LAT_A * self.autoCurveSpeedAggressiveness
 
     # Get the target velocity for the maximum curve
-    turnSpeed = max(abs(adjusted_target_lat_a / max_curve)**0.5  * 3.6, self.autoCurveSpeedLowerLimit)
+    #turnSpeed = max(abs(adjusted_target_lat_a / max_curve)**0.5  * 3.6, self.autoCurveSpeedLowerLimit)
+    turnSpeed = max(abs(adjusted_target_lat_a / max_curve)**0.5  * 3.6, 5)
     turnSpeed = min(turnSpeed, 250)
     return turnSpeed * curv_direction
 
@@ -804,11 +967,15 @@ class CarrotServ:
     self.params_memory = Params("/dev/shm/params")
 
     self.nRoadLimitSpeed = 30
+    self.nRoadLimitSpeed_last = 30
+    self.nRoadLimitSpeed_counter = 0
 
     self.active_carrot = 0     ## 1: CarrotMan Active, 2: sdi active , 3: speed decel active, 4: section active, 5: bump active, 6: speed limit active
     self.active_count = 0
     self.active_sdi_count = 0
     self.active_sdi_count_max = 200 # 20 sec
+
+    self.active_kisa_count = 0
 
     self.nSdiType = -1
     self.nSdiSpeedLimit = 0
@@ -850,15 +1017,21 @@ class CarrotServ:
 
     self.nPosSpeed = 0.0
     self.nPosAngle = 0.0
+    self.nPosAnglePhone = 0.0
 
     self.diff_angle_count = 0
-    self.last_update_gps_time = 0
     self.last_calculate_gps_time = 0
+    self.last_update_gps_time = 0
+    self.last_update_gps_time_phone = 0
+    self.last_update_gps_time_navi = 0
     self.bearing_offset = 0.0
     self.bearing_measured = 0.0
     self.bearing = 0.0
     self.gps_valid = False
 
+    self.gps_accuracy_phone = 0.0
+    self.gps_accuracy_device = 0.0
+    
     self.totalDistance = 0
     self.xSpdLimit = 0
     self.xSpdDist = 0
@@ -893,9 +1066,8 @@ class CarrotServ:
     self.atc_paused = False
     self.atc_activate_count = 0
     self.gas_override_speed = 0
+    self.gas_pressed_state = False
     self.source_last = "none"
-
-    self.gpsDelayTimeAdjust = 2.0
 
     self.debugText = ""
 
@@ -905,6 +1077,7 @@ class CarrotServ:
     self.autoNaviSpeedBumpSpeed = float(self.params.get_int("AutoNaviSpeedBumpSpeed"))
     self.autoNaviSpeedBumpTime = float(self.params.get_int("AutoNaviSpeedBumpTime"))
     self.autoNaviSpeedCtrlEnd = float(self.params.get_int("AutoNaviSpeedCtrlEnd"))
+    self.autoNaviSpeedCtrlMode = self.params.get_int("AutoNaviSpeedCtrlMode")
     self.autoNaviSpeedSafetyFactor = float(self.params.get_int("AutoNaviSpeedSafetyFactor")) * 0.01
     self.autoNaviSpeedDecelRate = float(self.params.get_int("AutoNaviSpeedDecelRate")) * 0.01
     self.autoNaviCountDownMode = self.params.get_int("AutoNaviCountDownMode")
@@ -915,19 +1088,16 @@ class CarrotServ:
     self.autoTurnMapChange = self.params.get_int("AutoTurnMapChange")
     self.autoTurnControl = self.params.get_int("AutoTurnControl")
     self.autoTurnControlTurnEnd = self.params.get_int("AutoTurnControlTurnEnd")
-    self.gpsDelayTimeAdjust = self.params.get_float("GpsDelayTimeAdjust") * 0.01
     #self.autoNaviSpeedDecelRate = float(self.params.get_int("AutoNaviSpeedDecelRate")) * 0.01
+    self.autoCurveSpeedLowerLimit = int(self.params.get("AutoCurveSpeedLowerLimit"))
+    self.is_metric = self.params.get_bool("IsMetric")
+    self.autoRoadSpeedLimitOffset = self.params.get_int("AutoRoadSpeedLimitOffset")
 
 
   def _update_cmd(self):
     if self.carrotCmdIndex != self.carrotCmdIndex_last:
       self.carrotCmdIndex_last = self.carrotCmdIndex
       command_handlers = {
-        "SPEED": self._handle_speed_command,
-        "CRUISE": self._handle_cruise_command,
-        "LANECHANGE": self._handle_lane_change,
-        "RECORD": self._handle_record_command,
-        "DISPLAY": self._handle_display_command,
         "DETECT": self._handle_detect_command,
       }
 
@@ -940,29 +1110,6 @@ class CarrotServ:
     if self.traffic_light_count < 0:
       self.traffic_light_count = -1
       self.traffic_state = 0
-
-  def _handle_speed_command(self, xArg):
-    self.params_memory.put_nonblocking("CarrotManCommand", "SPEED " + xArg)
-
-  def _handle_cruise_command(self, xArg):
-    self.params_memory.put_nonblocking("CarrotManCommand", "CRUISE " + xArg)
-
-  def _handle_lane_change(self, xArg):
-    self.params_memory.put_nonblocking("CarrotManCommand", "LANECHANGE " + xArg)
-    #if xArg == "RIGHT":
-    #  pass
-    #elif xArg == "LEFT":
-    #  pass
-
-  def _handle_record_command(self, xArg):
-    self.params_memory.put_nonblocking("CarrotManCommand", "RECORD " + xArg)
-
-  def _handle_display_command(self, xArg):
-    self.params_memory.put_nonblocking("CarrotManCommand", "DISPLAY " + xArg)
-    display_commands = {"MAP": "3", "FULLMAP": "4", "DEFAULT": "1", "ROAD": "2", "TOGGLE": "5"}
-    command = display_commands.get(xArg)
-    if command:
-      pass
 
   def _handle_detect_command(self, xArg):
     elements = [e.strip() for e in xArg.split(',')]
@@ -1115,72 +1262,72 @@ class CarrotServ:
 
   def _get_sdi_descr(self, nSdiType):
     sdi_types = {
-        0: "信号超速",
-        1: "超速 (固定式)",
-        2: "区间测速开始",
-        3: "区间测速结束",
-        4: "区间测速中",
-        5: "跟车超速摄像头",
-        6: "信号测速",
-        7: "超速 (移动式)",
-        8: "固定式超速危险区间(箱型)",
-        9: "公交专用车道区间",
-        10: "可变车道测速",
-        11: "窄路监控点",
-        12: "禁止插队",
-        13: "交通信息收集点",
-        14: "安防监控摄像头",
-        15: "超载车辆危险区间",
-        16: "超载测速",
-        17: "停车测速点",
-        18: "单行道",
-        19: "铁路道口",
-        20: "儿童保护区(学校区域开始区间)",
-        21: "儿童保护区(学校区域结束区间)",
-        22: "减速带",
-        23: "LPG加气站",
-        24: "隧道区间",
-        25: "休息区",
-        26: "收费站",
-        27: "雾注意区域",
-        28: "有害物质区域",
-        29: "事故多发",
-        30: "急弯道区域",
-        31: "急弯道区间1",
-        32: "陡坡区间",
-        33: "野生动物交通事故多发区间",
-        34: "右侧视野不良点",
-        35: "视野不良点",
-        36: "左侧视野不良点",
-        37: "信号违规多发区间",
-        38: "超速行驶多发区间",
-        39: "交通拥堵区域",
-        40: "方向车道选择点",
-        41: "乱穿马路事故多发点",
-        42: "窄路事故多发点",
-        43: "超速事故多发点",
-        44: "疲劳驾驶事故多发点",
-        45: "事故多发点",
-        46: "行人事故多发点",
-        47: "车辆盗窃事故常发点",
-        48: "落石注意区域",
-        49: "结冰注意区域",
-        50: "瓶颈点",
-        51: "合流道路",
-        52: "坠落注意区域",
-        53: "地下车道区间",
-        54: "住宅密集区(交通管制区)",
-        55: "互通式立交",
-        56: "分岔点",
-        57: "休息区(LPG可充气)",
-        58: "桥梁",
-        59: "制动装置事故多发点",
-        60: "中央线侵犯事故多发点",
-        61: "通行违规事故多发点",
-        62: "目的地对面引导",
-        63: "疲劳休息区引导",
-        64: "老旧柴油车测速",
-        65: "隧道内车道变更测速",
+        0: "신호과속",
+        1: "과속 (고정식)",
+        2: "구간단속 시작",
+        3: "구간단속 끝",
+        4: "구간단속중",
+        5: "꼬리물기단속카메라",
+        6: "신호 단속",
+        7: "과속 (이동식)",
+        8: "고정식 과속위험 구간(박스형)",
+        9: "버스전용차로구간",
+        10: "가변 차로 단속",
+        11: "갓길 감시 지점",
+        12: "끼어들기 금지",
+        13: "교통정보 수집지점",
+        14: "방범용cctv",
+        15: "과적차량 위험구간",
+        16: "적재 불량 단속",
+        17: "주차단속 지점",
+        18: "일방통행도로",
+        19: "철길 건널목",
+        20: "어린이 보호구역(스쿨존 시작 구간)",
+        21: "어린이 보호구역(스쿨존 끝 구간)",
+        22: "과속방지턱",
+        23: "lpg충전소",
+        24: "터널 구간",
+        25: "휴게소",
+        26: "톨게이트",
+        27: "안개주의 지역",
+        28: "유해물질 지역",
+        29: "사고다발",
+        30: "급커브지역",
+        31: "급커브구간1",
+        32: "급경사구간",
+        33: "야생동물 교통사고 잦은 구간",
+        34: "우측시야불량지점",
+        35: "시야불량지점",
+        36: "좌측시야불량지점",
+        37: "신호위반다발구간",
+        38: "과속운행다발구간",
+        39: "교통혼잡지역",
+        40: "방향별차로선택지점",
+        41: "무단횡단사고다발지점",
+        42: "갓길 사고 다발 지점",
+        43: "과속 사발 다발 지점",
+        44: "졸음 사고 다발 지점",
+        45: "사고다발지점",
+        46: "보행자 사고다발지점",
+        47: "차량도난사고 상습발생지점",
+        48: "낙석주의지역",
+        49: "결빙주의지역",
+        50: "병목지점",
+        51: "합류 도로",
+        52: "추락주의지역",
+        53: "지하차도 구간",
+        54: "주택밀집지역(교통진정지역)",
+        55: "인터체인지",
+        56: "분기점",
+        57: "휴게소(lpg충전가능)",
+        58: "교량",
+        59: "제동장치사고다발지점",
+        60: "중앙선침범사고다발지점",
+        61: "통행위반사고다발지점",
+        62: "목적지 건너편 안내",
+        63: "졸음 쉼터 안내",
+        64: "노후경유차단속",
+        65: "터널내 차로변경단속",
         66: ""
     }
     return sdi_types.get(nSdiType, "")
@@ -1190,16 +1337,17 @@ class CarrotServ:
     # 1: startOSEPS: 구간단속시작
     # 2: inOSEPS: 구간단속중
     # 3: endOSEPS: 구간단속종료
-    if self.nSdiType in [0,1,2,3,4,7,8, 75, 76] and self.nSdiSpeedLimit > 0:
+    # 0:감속안함,1:과속카메라,2:+사고방지턱,3:+이동식카메라
+    if self.nSdiType in [0,1,2,3,4,7,8, 75, 76] and self.nSdiSpeedLimit > 0 and self.autoNaviSpeedCtrlMode > 0:
       self.xSpdLimit = self.nSdiSpeedLimit * self.autoNaviSpeedSafetyFactor
       self.xSpdDist = self.nSdiDist
       self.xSpdType = self.nSdiType
       if self.nSdiBlockType in [2,3]:
         self.xSpdDist = self.nSdiBlockDist
         self.xSpdType = 4
-      elif self.nSdiType == 7: #이동식카메라
+      elif self.nSdiType == 7 and self.autoNaviSpeedCtrlMode < 3: #이동식카메라
         self.xSpdLimit = self.xSpdDist = 0
-    elif (self.nSdiPlusType == 22 or self.nSdiType == 22) and self.roadcate > 1: # speed bump, roadcate:0,1: highway
+    elif (self.nSdiPlusType == 22 or self.nSdiType == 22) and self.roadcate > 1 and self.autoNaviSpeedCtrlMode >= 2: # speed bump, roadcate:0,1: highway
       self.xSpdLimit = self.autoNaviSpeedBumpSpeed
       self.xSpdDist = self.nSdiPlusDist if self.nSdiPlusType == 22 else self.nSdiDist
       self.xSpdType = 22
@@ -1209,30 +1357,49 @@ class CarrotServ:
       self.xSpdDist = 0
 
   def _update_gps(self, v_ego, sm):
-    if not sm.updated['carState'] or not sm.updated['carControl']:
+    llk = 'liveLocationKalman'
+    location = sm[llk]
+    #print(f"location = {sm.valid[llk]}, {sm.updated[llk]}, {sm.recv_frame[llk]}, {sm.recv_time[llk]}")
+    if not sm.updated['carState'] or not sm.updated['carControl']: # or not sm.updated[llk]:
       return self.nPosAngle
     CS = sm['carState']
     CC = sm['carControl']
-    if len(CC.orientationNED) == 3:
-      bearing = math.degrees(CC.orientationNED[2])
-    else:
-      bearing = 0.0
-      return self.nPosAngle
+    self.gps_valid = (location.status == log.LiveLocationKalman.Status.valid) and location.positionGeodetic.valid
 
-    if not self.gps_valid:
-      if self.params_memory.get("LastGPSPosition"):
-        self.gps_valid = True
+    now = time.monotonic()
+    gps_updated_phone = (now - self.last_update_gps_time_phone) < 3
+    gps_updated_navi = (now - self.last_update_gps_time_navi) < 3
 
-    if self.gps_valid:    # liveLocationKalman일때는 정확하나, livePose일때는 불안정함.
+    bearing = self.nPosAngle
+    if gps_updated_phone:
       self.bearing_offset = 0.0
-    else:
+    elif sm.valid[llk]:
+      bearing = math.degrees(location.calibratedOrientationNED.value[2])
+      if self.gps_valid:
+        self.bearing_offset = 0.0
+      elif self.active_carrot > 0:
+        bearing = self.nPosAnglePhone
+        self.bearing_offset = 0.0
+
+    #print(f"bearing = {bearing:.1f}, posA=={self.nPosAngle:.1f}, posP=={self.nPosAnglePhone:.1f}, offset={self.bearing_offset:.1f}, {gps_updated_phone}, {gps_updated_navi}")
+    gpsDelayTimeAdjust = 0.0
+    if gps_updated_navi:
+      gpsDelayTimeAdjust = 1.0
+
+    external_gps_update_timedout = not (gps_updated_phone or gps_updated_navi)
+    #print(f"gps_valid = {self.gps_valid}, bearing = {bearing:.1f}, pos = {location.positionGeodetic.value[0]:.6f}, {location.positionGeodetic.value[1]:.6f}")
+    if self.gps_valid and external_gps_update_timedout:    # 내부GPS가 자동하고 carrotman으로부터 gps신호가 없는경우
+      self.vpPosPointLatNavi = location.positionGeodetic.value[0]
+      self.vpPosPointLonNavi = location.positionGeodetic.value[1]
+      self.last_calculate_gps_time = now #sm.recv_time[llk]
+    elif gps_updated_navi:  # carrot navi로부터 gps신호가 수신되는 경우..
       if abs(self.bearing_measured - bearing) < 0.1:
           self.diff_angle_count += 1
       else:
           self.diff_angle_count = 0
       self.bearing_measured = bearing
 
-      if self.diff_angle_count > 5: # 각도변화가 거의 없을때만 업데이트
+      if self.diff_angle_count > 5: # 조향각도변화가 거의 없을때만 업데이트
         diff_angle = (self.nPosAngle - bearing) % 360
         if diff_angle > 180:
           diff_angle -= 360
@@ -1240,13 +1407,18 @@ class CarrotServ:
 
     bearing_calculated = (bearing + self.bearing_offset) % 360
 
-    now = time.monotonic()
     dt = now - self.last_calculate_gps_time
-    #self.last_calculate_gps_time = now
-    self.vpPosPointLat, self.vpPosPointLon = self.estimate_position(float(self.vpPosPointLatNavi), float(self.vpPosPointLonNavi), v_ego, bearing_calculated, dt + self.gpsDelayTimeAdjust)
+    #print(f"dt = {dt:.1f}, {self.vpPosPointLatNavi}, {self.vpPosPointLonNavi}")
+    if dt > 5.0:
+      self.vpPosPointLat, self.vpPosPointLon = 0.0, 0.0
+    elif dt == 0:
+      self.vpPosPointLat, self.vpPosPointLon = self.vpPosPointLatNavi, self.vpPosPointLonNavi
+    else:
+      self.vpPosPointLat, self.vpPosPointLon = self.estimate_position(float(self.vpPosPointLatNavi), float(self.vpPosPointLonNavi), v_ego, bearing_calculated, dt + gpsDelayTimeAdjust)
 
     #self.debugText = " {} {:.1f},{:.1f}={:.1f}+{:.1f}".format(self.active_sdi_count, self.nPosAngle, bearing_calculated, bearing, self.bearing_offset)
     #print("nPosAngle = {:.1f},{:.1f} = {:.1f}+{:.1f}".format(self.nPosAngle, bearing_calculated, bearing, self.bearing_offset))
+
     return float(bearing_calculated)
 
 
@@ -1298,24 +1470,28 @@ class CarrotServ:
       if check_steer:
         self.atc_activate_count = max(0, self.atc_activate_count + 1)
       if atc_type in ["turn left", "turn right"] and x_dist_to_turn > start_turn_dist:
-        atc_type = "fork left" if atc_type == "turn left" else "fork right"
+        atc_type = "atc left" if atc_type == "turn left" else "atc right"
 
-    if self.autoTurnMapChange > 0 and check_steer:
+    if self.autoTurnMapChange > 0 and check_steer: 
       #print(f"x_dist_to_turn: {x_dist_to_turn}, atc_start_dist: {atc_start_dist}")
       #print(f"atc_activate_count: {self.atc_activate_count}")
       if self.atc_activate_count == 2:
-        self.params_memory.put_nonblocking("CarrotManCommand", "DISPLAY MAP")
+        self.carrotCmdIndex += 100
+        self.carrotCmd = "DISPLAY";
+        self.carrotArg = "MAP";
       elif self.atc_activate_count == -50:
-        self.params_memory.put_nonblocking("CarrotManCommand", "DISPLAY ROAD")
+        self.carrotCmdIndex += 100
+        self.carrotCmd = "DISPLAY";
+        self.carrotArg = "ROAD";
 
     if check_steer:
       if 0 <= x_dist_to_turn < atc_start_dist and atc_type in ["fork left", "fork right"]:
         if not self.atc_paused:
           steering_pressed = sm["carState"].steeringPressed
           steering_torque = sm["carState"].steeringTorque
-          if steering_pressed and steering_torque < 0 and atc_type == "fork left":
+          if steering_pressed and steering_torque < 0 and atc_type in ["fork left", "atc left"]:
             self.atc_paused = True
-          elif steering_pressed and steering_torque > 0 and atc_type == "fork right":
+          elif steering_pressed and steering_torque > 0 and atc_type in ["fork right", "atc right"]:
             self.atc_paused = True
       else:
         self.atc_paused = False
@@ -1331,9 +1507,69 @@ class CarrotServ:
 
 
     return atc_desired, atc_type, atc_speed, atc_dist
+  
+  def update_nav_instruction(self, sm):
+    if sm.alive['navInstruction'] and sm.valid['navInstruction']:
+      msg_nav = sm['navInstruction']
 
+      self.nGoPosDist = int(msg_nav.distanceRemaining)
+      self.nGoPosTime = int(msg_nav.timeRemaining)
+      self.nRoadLimitSpeed = max(30, round(msg_nav.speedLimit * 3.6))
+      self.xDistToTurn = int(msg_nav.maneuverDistance)
+      self.szTBTMainText = msg_nav.maneuverPrimaryText
+      self.xTurnInfo = -1
+      for key, value in nav_type_mapping.items():
+        if value[0] == msg_nav.maneuverType and value[1] == msg_nav.maneuverModifier:
+          self.xTurnInfo = value[2]
+          break
+
+      self.debugText = f"{self.nRoadLimitSpeed},{msg_nav.maneuverType},{msg_nav.maneuverModifier} "
+      #print(msg_nav)
+      #print(f"navInstruction: {self.xTurnInfo}, {self.xDistToTurn}, {self.szTBTMainText}")
+
+  def update_kisa(self, data):
+    self.active_kisa_count = 100
+    if "kisawazecurrentspd" in data:
+      pass
+    if "kisawazeroadspdlimit" in data:
+      road_limit_speed = data["kisawazeroadspdlimit"]
+      if road_limit_speed > 0:
+        print(f"kisawazeroadspdlimit: {road_limit_speed} km/h")
+        if not self.is_metric:
+          road_limit_speed *= CV.MPH_TO_KPH
+        self.nRoadLimitSpeed = road_limit_speed 
+    if "kisawazealert" in data:
+      pass
+    if "kisawazeendalert" in data:
+      pass
+    if "kisawazeroadname" in data:
+      print(f"kisawazeroadname: {data['kisawazeroadname']}")
+      self.szPosRoadName = data["kisawazeroadname"]
+    if "kisawazereportid" in data and "kisawazealertdist" in data:
+      id_str = data["kisawazereportid"]
+      dist_str = data["kisawazealertdist"].lower()
+      import re
+      match = re.search(r'(\d+)', dist_str)
+      distance = int(match.group(1)) if match else 0
+      if not self.is_metric:
+        distance = int(distance * 0.3048)
+      print(f"{id_str}: {distance} m")
+      xSpdType = -1
+      if 'camera' in id_str:
+        xSpdType = 101    # 101: waze speed cam, 100: police
+      elif 'police' in id_str:
+        xSpdType = 100
+
+      if xSpdType >= 0:
+        offset = 5 if self.is_metric else 5 * CV.MPH_TO_KPH
+        self.xSpdLimit = self.nRoadLimitSpeed + offset
+        
+        self.xSpdDist = distance
+        self.xSpdType =xSpdType 
+    
   def update_navi(self, remote_ip, sm, pm, vturn_speed, coords, distances, route_speed):
 
+    self.debugText = ""
     self.update_params()
     if sm.alive['carState'] and sm.alive['selfdriveState']:
       CS = sm['carState']
@@ -1342,23 +1578,40 @@ class CarrotServ:
       distanceTraveled = sm['selfdriveState'].distanceTraveled
       delta_dist = distanceTraveled - self.totalDistance
       self.totalDistance = distanceTraveled
+      if CS.speedLimit > 0 and self.active_carrot <= 1:
+        self.nRoadLimitSpeed = CS.speedLimit
     else:
       v_ego = v_ego_kph = 0
       delta_dist = 0
       CS = None
 
+    road_speed_limit_changed = True if self.nRoadLimitSpeed != self.nRoadLimitSpeed_last else False
+    self.nRoadLimitSpeed_last = self.nRoadLimitSpeed
     #self.bearing = self.nPosAngle #self._update_gps(v_ego, sm)
     self.bearing = self._update_gps(v_ego, sm)
 
-    self.xSpdDist = max(self.xSpdDist - delta_dist, 0)
-    self.xDistToTurn = max(self.xDistToTurn - delta_dist, 0)
-    self.xDistToTurnNext = max(self.xDistToTurnNext - delta_dist, 0)
+    self.xSpdDist = max(self.xSpdDist - delta_dist, -1000)
+    self.xDistToTurn = self.xDistToTurn - delta_dist
+    self.xDistToTurnNext = self.xDistToTurnNext - delta_dist
     self.active_count = max(self.active_count - 1, 0)
     self.active_sdi_count = max(self.active_sdi_count - 1, 0)
-    if self.active_count > 0:
+    self.active_kisa_count = max(self.active_kisa_count - 1, 0)
+    if self.active_kisa_count > 0:
+      self.active_carrot = 2
+      
+    elif self.active_count > 0:
       self.active_carrot = 2 if self.active_sdi_count > 0 else 1
     else:
       self.active_carrot = 0
+
+    if self.autoRoadSpeedLimitOffset >= 0 and self.active_carrot>=2:
+      if self.nRoadLimitSpeed >= 30:
+        road_speed_limit_offset = self.autoRoadSpeedLimitOffset
+        if not self.is_metric:
+          road_speed_limit_offset *= CV.KPH_TO_MPH
+        limit_speed = self.nRoadLimitSpeed + road_speed_limit_offset
+    else:
+      limit_speed = 200
 
     if self.active_carrot <= 1:
       self.xSpdType = self.navType = self.xTurnInfo = self.xTurnInfoNext = -1
@@ -1366,12 +1619,14 @@ class CarrotServ:
       self.nTBTTurnType = self.nTBTTurnTypeNext = -1
       self.roadcate = 8
       self.nGoPosDist = 0
+      self.update_nav_instruction(sm)
 
-    if self.xSpdType < 0 or self.xSpdDist <= 0:
+    if self.xSpdType < 0 or (self.xSpdType not in [100,101] and self.xSpdDist <= 0) or (self.xSpdType in [100,101] and self.xSpdDist < -250):
       self.xSpdType = -1
       self.xSpdDist = self.xSpdLimit = 0
     if self.xTurnInfo < 0 or self.xDistToTurn < -50:
-      self.xDistToTurn = 0
+      if self.xDistToTurn > 0:
+        self.xDistToTurn = 0
       self.xTurnInfo = -1
       self.xDistToTurnNext = 0
       self.xTurnInfoNext = -1
@@ -1379,12 +1634,12 @@ class CarrotServ:
     sdi_speed = 250
     hda_active = False
     ### 과속카메라, 사고방지턱
-    if self.xSpdDist > 0 and self.active_carrot > 0:
+    if (self.xSpdDist > 0 or self.xSpdType in [100, 101]) and self.active_carrot > 0:
       safe_sec = self.autoNaviSpeedBumpTime if self.xSpdType == 22 else self.autoNaviSpeedCtrlEnd
       decel = self.autoNaviSpeedDecelRate
       sdi_speed = min(sdi_speed, self.calculate_current_speed(self.xSpdDist, self.xSpdLimit, safe_sec, decel))
       self.active_carrot = 5 if self.xSpdType == 22 else 3
-      if self.xSpdType == 4:
+      if self.xSpdType == 4 or (self.xSpdType in [100, 101] and self.xSpdDist <= 0):
         sdi_speed = self.xSpdLimit
         self.active_carrot = 4
     elif CS is not None and CS.speedLimit > 0 and CS.speedLimitDistance > 0:
@@ -1396,6 +1651,7 @@ class CarrotServ:
       #self.active_carrot = 6
       hda_active = True
 
+    #print(f"sdi_speed: {sdi_speed}, hda_active: {hda_active}, xSpdType: {self.xSpdType}, xSpdDist: {self.xSpdDist}, active_carrot: {self.active_carrot}, v_ego_kph: {v_ego_kph}, nRoadLimitSpeed: {self.nRoadLimitSpeed}")
     ### TBT 속도제어
     atc_desired, self.atcType, self.atcSpeed, self.atcDist = self.update_auto_turn(v_ego*3.6, sm, self.xTurnInfo, self.xDistToTurn, True)
     atc_desired_next, _, _, _ = self.update_auto_turn(v_ego*3.6, sm, self.xTurnInfoNext, self.xDistToTurnNext, False)
@@ -1426,16 +1682,18 @@ class CarrotServ:
     speed_n_sources = [
       (atc_desired, "atc"),
       (atc_desired_next, "atc2"),
-      (sdi_speed, "hda" if hda_active else "bump" if self.xSpdType == 22 else "section" if self.xSpdType == 4 else "cam"),
+      (sdi_speed, "hda" if hda_active else "bump" if self.xSpdType == 22 else "section" if self.xSpdType == 4 else "police" if self.xSpdType == 100 else "waze" if self.xSpdType == 101 else "cam"),
+      (limit_speed, "road"),
     ]
     if self.turnSpeedControlMode in [1,2]:
-      speed_n_sources.append((abs(vturn_speed), "vturn"))
+      speed_n_sources.append((max(abs(vturn_speed), self.autoCurveSpeedLowerLimit), "vturn"))
 
+    route_speed = max(route_speed * self.mapTurnSpeedFactor, self.autoCurveSpeedLowerLimit)
     if self.turnSpeedControlMode == 2:
-      if 0 < self.xDistToTurn < 300:
-        speed_n_sources.append((route_speed * self.mapTurnSpeedFactor, "route"))
+      if -500 < self.xDistToTurn < 500:
+        speed_n_sources.append((route_speed, "route"))
     elif self.turnSpeedControlMode == 3:
-      speed_n_sources.append((route_speed * self.mapTurnSpeedFactor, "route"))
+      speed_n_sources.append((route_speed, "route"))
       #speed_n_sources.append((self.calculate_current_speed(dist, speed * self.mapTurnSpeedFactor, 0, 1.2), "route"))
 
     desired_speed, source = min(speed_n_sources, key=lambda x: x[0])
@@ -1443,17 +1701,20 @@ class CarrotServ:
     if CS is not None:
       if source != self.source_last:
         self.gas_override_speed = 0
-      if CS.vEgo < 0.1 or desired_speed > 150 or source in ["cam", "section"] or CS.brakePressed:
+        self.gas_pressed_state = CS.gasPressed
+      if CS.vEgo < 0.1 or desired_speed > 150 or source in ["cam", "section", "police"] or CS.brakePressed or road_speed_limit_changed:
         self.gas_override_speed = 0
-      elif CS.gasPressed:
+      elif CS.gasPressed and not self.gas_pressed_state:
         self.gas_override_speed = max(v_ego_kph, self.gas_override_speed)
+      else:
+        self.gas_pressed_state = False
       self.source_last = source
 
       if desired_speed < self.gas_override_speed:
         source = "gas"
         desired_speed = self.gas_override_speed
 
-      self.debugText = ""#f"desired={desired_speed:.1f},{source},g={self.gas_override_speed:.0f}"
+      self.debugText += f"route={route_speed:.1f}"#f"desired={desired_speed:.1f},{source},g={self.gas_override_speed:.0f}"
 
     left_spd_sec = 100
     left_tbt_sec = 100
@@ -1491,7 +1752,6 @@ class CarrotServ:
 
 
     self._update_cmd()
-
     msg = messaging.new_message('carrotMan')
     msg.valid = True
     msg.carrotMan.activeCarrot = self.active_carrot
@@ -1515,7 +1775,7 @@ class CarrotServ:
     msg.carrotMan.carrotArg = self.carrotArg
     msg.carrotMan.trafficState = self.traffic_state
 
-    msg.carrotMan.xPosSpeed = float(self.nPosSpeed)
+    msg.carrotMan.xPosSpeed = float(v_ego_kph) #float(self.nPosSpeed)
     msg.carrotMan.xPosAngle = float(self.bearing)
     msg.carrotMan.xPosLat = float(self.vpPosPointLat)
     msg.carrotMan.xPosLon = float(self.vpPosPointLon)
@@ -1529,101 +1789,52 @@ class CarrotServ:
     msg.carrotMan.naviPaths = coords_str
 
     msg.carrotMan.leftSec = int(self.carrot_left_sec)
-
     pm.send('carrotMan', msg)
 
+    inst = messaging.new_message('navInstructionCarrot')
+    if self.active_carrot > 1:
+      inst.valid = True
+    
+      instruction = inst.navInstructionCarrot
+      instruction.distanceRemaining = self.nGoPosDist
+      instruction.timeRemaining = self.nGoPosTime
+      instruction.speedLimit = self.nRoadLimitSpeed / 3.6 if self.nRoadLimitSpeed > 0 else 0
+      instruction.maneuverDistance = float(self.nTBTDist)
+      instruction.maneuverSecondaryText = self.szNearDirName
+      if self.szFarDirName and len(self.szFarDirName):
+        instruction.maneuverSecondaryText += "[{}]".format(self.szFarDirName)
+      instruction.maneuverPrimaryText = self.szTBTMainText
+      instruction.timeRemainingTypical = self.nGoPosTime
 
-    nav_type_mapping = {
-      12: ("turn", "left", 1),
-      16: ("turn", "sharp left", 1),
-      13: ("turn", "right", 2),
-      19: ("turn", "sharp right", 2),
-      102: ("off ramp", "slight left", 3),
-      105: ("off ramp", "slight left", 3),
-      112: ("off ramp", "slight left", 3),
-      115: ("off ramp", "slight left", 3),
-      101: ("off ramp", "slight right", 4),
-      104: ("off ramp", "slight right", 4),
-      111: ("off ramp", "slight right", 4),
-      114: ("off ramp", "slight right", 4),
-      7: ("fork", "left", 3),
-      44: ("fork", "left", 3),
-      17: ("fork", "left", 3),
-      75: ("fork", "left", 3),
-      76: ("fork", "left", 3),
-      118: ("fork", "left", 3),
-      6: ("fork", "right", 4),
-      43: ("fork", "right", 4),
-      73: ("fork", "right", 4),
-      74: ("fork", "right", 4),
-      123: ("fork", "right", 4),
-      124: ("fork", "right", 4),
-      117: ("fork", "right", 4),
-      131: ("rotary", "slight right", 5),
-      132: ("rotary", "slight right", 5),
-      140: ("rotary", "slight left", 5),
-      141: ("rotary", "slight left", 5),
-      133: ("rotary", "right", 5),
-      134: ("rotary", "sharp right", 5),
-      135: ("rotary", "sharp right", 5),
-      136: ("rotary", "sharp left", 5),
-      137: ("rotary", "sharp left", 5),
-      138: ("rotary", "sharp left", 5),
-      139: ("rotary", "left", 5),
-      142: ("rotary", "straight", 5),
-      14: ("turn", "uturn", 5),
-      201: ("arrive", "straight", 5),
-      51: ("notification", "straight", None),
-      52: ("notification", "straight", None),
-      53: ("notification", "straight", None),
-      54: ("notification", "straight", None),
-      55: ("notification", "straight", None),
-      153: ("", "", 6),  #TG
-      154: ("", "", 6),  #TG
-      249: ("", "", 6)   #TG
-    }
+      navType, navModifier, xTurnInfo1 = "invalid", "", -1
+      if self.nTBTTurnType in nav_type_mapping:
+        navType, navModifier, xTurnInfo1 = nav_type_mapping[self.nTBTTurnType]
+      navTypeNext, navModifierNext, xTurnInfoNext = "invalid", "", -1
+      if self.nTBTTurnTypeNext in nav_type_mapping:
+        navTypeNext, navModifierNext, xTurnInfoNext = nav_type_mapping[self.nTBTTurnTypeNext]
+      
+      instruction.maneuverType = navType
+      instruction.maneuverModifier = navModifier
 
-    msg = messaging.new_message('navInstruction')
-    msg.valid = True
-
-    instruction = msg.navInstruction
-    instruction.distanceRemaining = self.nGoPosDist
-    instruction.timeRemaining = self.nGoPosTime
-    instruction.speedLimit = self.nRoadLimitSpeed / 3.6 if self.nRoadLimitSpeed > 0 else 0
-    instruction.maneuverDistance = float(self.nTBTDist)
-    instruction.maneuverSecondaryText = self.szNearDirName
-    if self.szFarDirName and len(self.szFarDirName):
-      instruction.maneuverSecondaryText += "[{}]".format(self.szFarDirName)
-    instruction.maneuverPrimaryText = self.szTBTMainText
-    instruction.timeRemainingTypical = self.nGoPosTime
-
-    navType, navModifier, xTurnInfo1 = "invalid", "", -1
-    if self.nTBTTurnType in nav_type_mapping:
-      navType, navModifier, xTurnInfo1 = nav_type_mapping[self.nTBTTurnType]
-    navTypeNext, navModifierNext, xTurnInfoNext = "invalid", "", -1
-    if self.nTBTTurnTypeNext in nav_type_mapping:
-      navTypeNext, navModifierNext, xTurnInfoNext = nav_type_mapping[self.nTBTTurnTypeNext]
-
-    instruction.maneuverType = navType
-    instruction.maneuverModifier = navModifier
-
-    maneuvers = []
-    if self.nTBTTurnType >= 0:
-      maneuver = {}
-      maneuver['distance'] = float(self.xDistToTurn)
-      maneuver['type'] = navType
-      maneuver['modifier'] = navModifier
-      maneuvers.append(maneuver)
-      if self.nTBTDistNext >= self.nTBTDist:
+      maneuvers = []
+      if self.nTBTTurnType >= 0:
         maneuver = {}
-        maneuver['distance'] = float(self.nTBTDistNext)
-        maneuver['type'] = navTypeNext
-        maneuver['modifier'] = navModifierNext
+        maneuver['distance'] = float(self.xDistToTurn)
+        maneuver['type'] = navType
+        maneuver['modifier'] = navModifier
         maneuvers.append(maneuver)
+        if self.nTBTDistNext >= self.nTBTDist:
+          maneuver = {}
+          maneuver['distance'] = float(self.nTBTDistNext)
+          maneuver['type'] = navTypeNext
+          maneuver['modifier'] = navModifierNext
+          maneuvers.append(maneuver)
 
-    instruction.allManeuvers = maneuvers
+      instruction.allManeuvers = maneuvers
+    elif sm.alive['navInstruction'] and sm.valid['navInstruction']:
+      inst.navInstructionCarrot = sm['navInstruction']
 
-    pm.send('navInstruction', msg)
+    pm.send('navInstructionCarrot', inst)
 
   def _update_system_time(self, epoch_time_remote, timezone_remote):
     epoch_time = int(time.time())
@@ -1681,9 +1892,10 @@ class CarrotServ:
     if "carrotIndex" in json:
       self.carrotIndex = int(json.get("carrotIndex"))
 
+    #print(json)
     if self.carrotIndex % 60 == 0 and "epochTime" in json:
       # op는 ntp를 사용하기때문에... 필요없는 루틴으로 보임.
-      timezone_remote = json.get("timezone", "Asia/Shanghai")
+      timezone_remote = json.get("timezone", "Asia/Seoul")
 
       if not PC:
         self.set_time(int(json.get("epochTime")), timezone_remote)
@@ -1691,18 +1903,21 @@ class CarrotServ:
       #self._update_system_time(int(json.get("epochTime")), timezone_remote)
 
     if "carrotCmd" in json:
-      print(json.get("carrotCmd"), json.get("carrotArg"))
+      #print(json.get("carrotCmd"), json.get("carrotArg"))
       self.carrotCmdIndex = self.carrotIndex
       self.carrotCmd = json.get("carrotCmd")
       self.carrotArg = json.get("carrotArg")
+      print(f"carrotCmd = {self.carrotCmd}, {self.carrotArg}")
 
     self.active_count = 80
+    now = time.monotonic()
 
     if "goalPosX" in json:
       self.goalPosX = float(json.get("goalPosX", self.goalPosX))
       self.goalPosY = float(json.get("goalPosY", self.goalPosY))
       self.szGoalName = json.get("szGoalName", self.szGoalName)
-    elif "nRoadLimitSpeed" in json:
+
+    if "nRoadLimitSpeed" in json:
       #print(json)
       self.active_sdi_count = self.active_sdi_count_max
       ### roadLimitSpeed
@@ -1714,7 +1929,13 @@ class CarrotServ:
           nRoadLimitSpeed = 30
       else:
         nRoadLimitSpeed = 30
-      self.nRoadLimitSpeed = nRoadLimitSpeed
+      #self.nRoadLimitSpeed = nRoadLimitSpeed
+      if self.nRoadLimitSpeed != nRoadLimitSpeed:
+        self.nRoadLimitSpeed_counter += 1
+        if self.nRoadLimitSpeed_counter > 5:
+          self.nRoadLimitSpeed = nRoadLimitSpeed
+      else:
+        self.nRoadLimitSpeed_counter = 0
 
       ### SDI
       self.nSdiType = int(json.get("nSdiType", -1))
@@ -1753,10 +1974,10 @@ class CarrotServ:
 
       self.vpPosPointLatNavi = float(json.get("vpPosPointLat", self.vpPosPointLatNavi))
       self.vpPosPointLonNavi = float(json.get("vpPosPointLon", self.vpPosPointLonNavi))
-      self.last_calculate_gps_time = time.monotonic()
+      self.last_update_gps_time_navi = self.last_calculate_gps_time = now
+      self.nPosAngle = float(json.get("nPosAngle", self.nPosAngle))
 
       self.nPosSpeed = float(json.get("nPosSpeed", self.nPosSpeed))
-      self.nPosAngle = float(json.get("nPosAngle", self.nPosAngle))
       self._update_tbt()
       self._update_sdi()
       print(
@@ -1769,6 +1990,19 @@ class CarrotServ:
       #print(json)
       pass
 
+    # 3초간 navi 데이터가 없으면, phone gps로 업데이트
+    if "latitude" in json:
+      self.nPosAnglePhone = float(json.get("heading", self.nPosAngle))
+      if (now - self.last_update_gps_time_navi) > 3.0:
+        self.vpPosPointLatNavi = float(json.get("latitude", self.vpPosPointLatNavi))
+        self.vpPosPointLonNavi = float(json.get("longitude", self.vpPosPointLonNavi))
+        self.nPosAngle = self.nPosAnglePhone
+        # self.nPosSpeed = self.ve # TODO speed from v_ego
+        self.last_update_gps_time_phone = self.last_calculate_gps_time = now
+        self.gps_accuracy_phone = float(json.get("accuracy", 0))
+        self.nPosSpeed = float(json.get("gps_speed", 0))
+        print(f"phone gps: {self.vpPosPointLatNavi}, {self.vpPosPointLonNavi}, {self.gps_accuracy_phone}, {self.nPosSpeed}")
+
 
 import traceback
 
@@ -1776,6 +2010,9 @@ def main():
   print("CarrotManager Started")
   #print("Carrot GitBranch = {}, {}".format(Params().get("GitBranch"), Params().get("GitCommitDate")))
   carrot_man = CarrotMan()
+
+  print(f"CarrotMan {carrot_man}")
+  threading.Thread(target=carrot_man.kisa_app_thread).start()
   while True:
     try:
       carrot_man.carrot_man_thread()

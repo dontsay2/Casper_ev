@@ -10,6 +10,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.modeld.constants import index_function
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 # from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
+from openpilot.selfdrive.carrot.carrot_functions import XState
 
 if __name__ == '__main__':  # generating code
   from openpilot.third_party.acados.acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
@@ -32,16 +33,16 @@ COST_E_DIM = 5
 COST_DIM = COST_E_DIM + 1
 CONSTR_DIM = 4
 
-X_EGO_OBSTACLE_COST = 6. #3.
+X_EGO_OBSTACLE_COST = 3.
 X_EGO_COST = 0.
 V_EGO_COST = 0.
 A_EGO_COST = 0.
 J_EGO_COST = 5.0
 A_CHANGE_COST = 250.
-A_CHANGE_COST_STARTING = 100.
+A_CHANGE_COST_STARTING = 30.
 DANGER_ZONE_COST = 100.
 CRASH_DISTANCE = .25
-LEAD_DANGER_FACTOR = 0.75
+LEAD_DANGER_FACTOR = 0.8 # 0.75
 LIMIT_COST = 1e6
 ACADOS_SOLVER_TYPE = 'SQP_RTI'
 
@@ -91,10 +92,10 @@ def get_safe_obstacle_distance(v_ego, t_follow=None, comfort_brake=COMFORT_BRAKE
     t_follow = get_T_FOLLOW()
   return (v_ego**2) / (2 * comfort_brake) + t_follow * v_ego + stop_distance
 
-def desired_follow_distance(v_ego, v_lead, t_follow=None):
+def desired_follow_distance(v_ego, v_lead, comfort_brake, stop_distance, t_follow=None):
   if t_follow is None:
     t_follow = get_T_FOLLOW()
-  return get_safe_obstacle_distance(v_ego, t_follow) - get_stopped_equivalence_factor(v_lead)
+  return get_safe_obstacle_distance(v_ego, t_follow, comfort_brake, stop_distance) - get_stopped_equivalence_factor(v_lead)
 
 
 def gen_long_model():
@@ -236,11 +237,17 @@ class LongitudinalMpc:
     self.mode = mode
     self.dt = dt
     self.solver = AcadosOcpSolverCython(MODEL_NAME, ACADOS_SOLVER_TYPE, N)
+
+    self.a_change_cost = A_CHANGE_COST
+    self.j_lead = 0.0
+
     self.reset()
     self.source = SOURCES[2]
 
     self.t_follow = 1.0
     self.desired_distance = 0.0
+    self.lead_danger_factor = LEAD_DANGER_FACTOR
+
 
   def reset(self):
     # self.solver = AcadosOcpSolverCython(MODEL_NAME, ACADOS_SOLVER_TYPE, N)
@@ -290,13 +297,13 @@ class LongitudinalMpc:
   def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard, jerk_factor=1.0):
     #jerk_factor = get_jerk_factor(personality)
     if self.mode == 'acc':
-      a_change_cost = A_CHANGE_COST if prev_accel_constraint else A_CHANGE_COST_STARTING
+      a_change_cost = self.a_change_cost if prev_accel_constraint else A_CHANGE_COST_STARTING
       cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST, jerk_factor * a_change_cost, jerk_factor * J_EGO_COST]
       constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
     elif self.mode == 'blended':
       a_change_cost = 40.0 if prev_accel_constraint else 0
       cost_weights = [0., 0.1, 0.2, 5.0, a_change_cost, 1.0]
-      constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, 50.0]
+      constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
     else:
       raise NotImplementedError(f'Planner mode {self.mode} not recognized in planner cost set')
     self.set_cost_weights(cost_weights, constraint_cost_weights)
@@ -310,19 +317,21 @@ class LongitudinalMpc:
         self.solver.set(i, 'x', self.x0)
 
   @staticmethod
-  def extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau):
-    a_lead_traj = a_lead * np.exp(-a_lead_tau * (T_IDXS**2)/2.)
+  def extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau, j_lead):
+    j_lead_tau = np.interp(j_lead, [-2.0, 0.0, 2.0], [0.2, 2.0, 0.1]) # tau: 2: 2sec, 1: 4sec, 0.5: 10sec
+    j_lead_traj = j_lead * np.exp(-j_lead_tau * (T_IDXS**2)/2.)
+    a_lead_traj = a_lead * np.exp(-a_lead_tau * (T_IDXS**2)/2.) + j_lead_traj
     v_lead_traj = np.clip(v_lead + np.cumsum(T_DIFFS * a_lead_traj), 0.0, 1e8)
     x_lead_traj = x_lead + np.cumsum(T_DIFFS * v_lead_traj)
     lead_xv = np.column_stack((x_lead_traj, v_lead_traj))
     return lead_xv
-
-  def process_lead(self, lead):
+  
+  def process_lead(self, lead, j_lead):
     v_ego = self.x0[1]
     if lead is not None and lead.status:
       x_lead = lead.dRel
       v_lead = lead.vLead
-      a_lead = lead.aLead
+      a_lead = lead.aLeadK
       a_lead_tau = lead.aLeadTau
     else:
       # Fake a fast lead car, so mpc can keep running in the same mode
@@ -337,8 +346,14 @@ class LongitudinalMpc:
     x_lead = np.clip(x_lead, min_x_lead, 1e8)
     v_lead = np.clip(v_lead, 0.0, 1e8)
     a_lead = np.clip(a_lead, -10., 5.)
-    lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
-    return lead_xv
+
+    if a_lead < -2.0 and j_lead > 0.5:
+      a_lead = a_lead + j_lead
+      a_lead = min(a_lead, -0.5)
+      a_lead_tau = max(a_lead_tau, 1.5)
+
+    lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau, j_lead)
+    return lead_xv, v_lead
 
   def set_accel_limits(self, min_a, max_a):
     # TODO this sets a max accel limit, but the minimum limit is only for cruise decel
@@ -352,27 +367,33 @@ class LongitudinalMpc:
     a_ego = self.x0[2]
     self.status = radarstate.leadOne.status or radarstate.leadTwo.status
 
-    lead_xv_0 = self.process_lead(radarstate.leadOne)
-    lead_xv_1 = self.process_lead(radarstate.leadTwo)
+    if radarstate.leadOne.status:
+      j_lead = radarstate.leadOne.jLead
+      self.j_lead = j_lead * 0.1 + self.j_lead * 0.9
+    else:
+      self.j_lead = 0.0
+
+    lead_xv_0, lead_v_0 = self.process_lead(radarstate.leadOne, np.clip(self.j_lead * carrot.j_lead_factor, -2.0, 2.0))
+    lead_xv_1, _ = self.process_lead(radarstate.leadTwo, 0.0)
+
+    mode = self.mode
+    comfort_brake = carrot.comfort_brake
+    stop_distance = carrot.stop_distance
+    
+    if mode == 'blended':
+      stop_x = 1000.0
+    else:
+      v_cruise, stop_x, mode = carrot.v_cruise, carrot.stop_dist, carrot.mode
+      desired_distance = desired_follow_distance(v_ego, lead_v_0, comfort_brake, stop_distance, t_follow)
+      t_follow = carrot.dynamic_t_follow(t_follow, radarstate.leadOne, desired_distance)
 
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
     # and then treat that as a stopped car/obstacle at this new distance.
     lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
     lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
-
-    mode = self.mode
-    comfort_brake = COMFORT_BRAKE
-    stop_distance = STOP_DISTANCE
-    desired_distance = desired_follow_distance(v_ego, radarstate.leadOne.vLead, t_follow)
-    if mode == 'blended':
-      stop_x = 1000.0
-    else:
-      v_cruise, stop_x, mode = carrot.v_cruise, carrot.stop_dist, carrot.mode
-      comfort_brake, stop_distance = carrot.comfort_brake, carrot.stop_distance
-      t_follow = carrot.dynamic_t_follow(t_follow, radarstate.leadOne, desired_distance)
-
-    self.desired_distance = desired_follow_distance(v_ego, radarstate.leadOne.vLead, t_follow)
+    
+    self.desired_distance = desired_follow_distance(v_ego, lead_v_0, comfort_brake, stop_distance, t_follow)
 
     self.params[:,0] = ACCEL_MIN if not reset_state else a_ego
     # negative accel constraint causes problems because negative speed is not allowed
@@ -380,7 +401,7 @@ class LongitudinalMpc:
 
     # Update in ACC mode or ACC/e2e blend
     if mode == 'acc':
-      self.params[:,5] = LEAD_DANGER_FACTOR
+      #self.params[:,5] = LEAD_DANGER_FACTOR
       # Fake an obstacle for cruise, this ensures smooth acceleration to set speed
       # when the leads are no factor.
       v_lower = v_ego + (T_IDXS * self.cruise_min_a * 1.05)
@@ -399,9 +420,23 @@ class LongitudinalMpc:
       x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle, cruise_obstacle, x2])
       self.source = SOURCES[np.argmin(x_obstacles[0])]
 
+      if v_cruise == 0 and self.source == 'cruise':
+        self.params[:,0] = - carrot.autoNaviSpeedDecelRate
+      #elif self.source in ['cruise', 'e2e']:
+      #  self.params[:,0] = - COMFORT_BRAKE
+
       # These are not used in ACC mode
       x[:], v[:], a[:], j[:] = 0.0, 0.0, 0.0, 0.0
 
+      if radarstate.leadOne.status:
+        self.a_change_cost = np.interp(abs(self.j_lead), [0.3, 2.0], [A_CHANGE_COST, 20])
+      else:
+        self.a_change_cost = A_CHANGE_COST
+
+      #safe_distance = lead_0_obstacle[0] - get_safe_obstacle_distance(v_ego, comfort_brake, stop_distance)
+      self.lead_danger_factor = LEAD_DANGER_FACTOR #np.interp(safe_distance, [-30.0, 0.0], [0.9, LEAD_DANGER_FACTOR]) # 이걸적용하니, 사고방지턱 감속시 너무 급정거하는것 같음.
+      self.params[:,5] = self.lead_danger_factor
+      
     elif mode == 'blended':
       self.params[:,5] = 1.0
 

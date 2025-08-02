@@ -39,18 +39,28 @@ class CarSpecificEvents:
     self.steering_unpressed = 0
     self.low_speed_alert = False
     self.no_steer_warning = False
-    self.silent_steer_warning = True
+    self.silent_steer_warning = 1
 
     self.cruise_buttons: deque = deque([], maxlen=HYUNDAI_PREV_BUTTON_SAMPLES)
 
     self.do_shutdown = False
+    self.params = Params()
+    self.frame = 0
+    self.mute_door = False
+    self.mute_seatbelt = False
+    self.vCruise_prev = 250
+    self.carrotCruise_prev = False
 
+  def update_params(self):
+    if self.frame % 100 == 0:
+      self.mute_seatbelt = self.params.get_bool("MuteSeatbelt")
+      self.mute_door = self.params.get_bool("MuteDoor")
+    
   def update(self, CS: car.CarState, CS_prev: car.CarState, CC: car.CarControl):
+    self.frame += 1
+    self.update_params()
     if self.CP.brand in ('body', 'mock'):
       events = Events()
-
-    elif self.CP.brand in ('byd', 'subaru', 'mazda'):
-      events = self.create_common_events(CS, CS_prev)
 
     elif self.CP.brand == 'ford':
       events = self.create_common_events(CS, CS_prev, extra_gears=[GearShifter.manumatic])
@@ -106,13 +116,9 @@ class CarSpecificEvents:
             events.add(EventName.manualRestart)
 
     elif self.CP.brand == 'gm':
-      # The ECM allows enabling on falling edge of set, but only rising edge of resume
       events = self.create_common_events(CS, CS_prev, extra_gears=[GearShifter.sport, GearShifter.low,
                                                                    GearShifter.eco, GearShifter.manumatic],
-                                         pcm_enable=self.CP.pcmCruise, enable_buttons=(ButtonType.decelCruise,))
-      if not self.CP.pcmCruise:
-        if any(b.type == ButtonType.accelCruise and b.pressed for b in CS.buttonEvents):
-          events.add(EventName.buttonEnable)
+                                         pcm_enable=self.CP.pcmCruise)
 
       # Enabling at a standstill with brake is allowed
       # TODO: verify 17 Volt can enable for the first time at a stop and allow for all GMs
@@ -126,8 +132,7 @@ class CarSpecificEvents:
 
     elif self.CP.brand == 'volkswagen':
       events = self.create_common_events(CS, CS_prev, extra_gears=[GearShifter.eco, GearShifter.sport, GearShifter.manumatic],
-                                         pcm_enable=self.CP.pcmCruise,
-                                         enable_buttons=(ButtonType.setCruise, ButtonType.resumeCruise))
+                                         pcm_enable=self.CP.pcmCruise)
 
       # Low speed steer alert hysteresis logic
       if (self.CP.minSteerSpeed - 1e-3) > VWCarControllerParams.DEFAULT_MIN_STEER_SPEED and CS.vEgo < (self.CP.minSteerSpeed + 1.):
@@ -165,20 +170,31 @@ class CarSpecificEvents:
         events.add(EventName.belowSteerSpeed)
 
     else:
-      raise ValueError(f"Unsupported car: {self.CP.brand}")
+      events = self.create_common_events(CS, CS_prev)
+
+    if CC.enabled:
+      if self.vCruise_prev == 0 and CS.vCruise > 0:
+        events.add(EventName.audioPrompt)
+
+    if self.carrotCruise_prev != CS.carrotCruise:
+      events.add(EventName.audioPrompt)
+
+    self.carrotCruise_prev = CS.carrotCruise
+    self.vCruise_prev = CS.vCruise
 
     return events
 
   def create_common_events(self, CS: structs.CarState, CS_prev: car.CarState, extra_gears=None, pcm_enable=True,
-                           allow_enable=True, allow_button_cancel=True, enable_buttons=(ButtonType.accelCruise, ButtonType.decelCruise)):
+                           allow_enable=True, allow_button_cancel=True):
     events = Events()
-
-    if CS.doorOpen:
+    
+    if CS.doorOpen and not self.mute_door:
       events.add(EventName.doorOpen)
-    if CS.seatbeltUnlatched:
+    if CS.seatbeltUnlatched and not self.mute_seatbelt:
       events.add(EventName.seatbeltNotLatched)
-    if CS.gearShifter != GearShifter.drive and (extra_gears is None or
-       CS.gearShifter not in extra_gears):
+    if CS.gearShifter == GearShifter.park:
+      events.add(EventName.wrongGear)
+    if CS.gearShifter == GearShifter.neutral:
       events.add(EventName.wrongGear)
     if CS.gearShifter == GearShifter.reverse:
       events.add(EventName.reverseGear)
@@ -214,19 +230,18 @@ class CarSpecificEvents:
       events.add(EventName.invalidLkasSetting)
     if CS.lowSpeedAlert:
       events.add(EventName.belowSteerSpeed)
+    if CS.buttonEnable:
+      events.add(EventName.buttonEnable)
 
-    # Handle button presses
+    # Handle cancel button presses
     for b in CS.buttonEvents:
-      # Enable OP long on falling edge of enable buttons (defaults to accelCruise and decelCruise, overridable per-port)
-      if not self.CP.pcmCruise and (b.type in enable_buttons and not b.pressed):
-        events.add(EventName.buttonEnable)
       # Disable on rising and falling edge of cancel for both stock and OP long
       # TODO: only check the cancel button with openpilot longitudinal on all brands to match panda safety
       if b.type == ButtonType.cancel and (allow_button_cancel or not self.CP.pcmCruise):
         events.add(EventName.buttonCancel)
         if CS.gearShifter == GearShifter.park and not self.do_shutdown:
           self.do_shutdown = True
-          Params().put_bool("DoShutdown", True)
+          self.params.put_bool("DoShutdown", True)
 
     # Handle permanent and temporary steering faults
     self.steering_unpressed = 0 if CS.steeringPressed else self.steering_unpressed + 1
@@ -237,14 +252,15 @@ class CarSpecificEvents:
         self.no_steer_warning = False
 
         # if the user overrode recently, show a less harsh alert
-        if self.silent_steer_warning or CS.standstill or self.steering_unpressed < int(1.5 / DT_CTRL):
-          self.silent_steer_warning = True
-          events.add(EventName.steerTempUnavailableSilent)
+        if self.silent_steer_warning > 0 or CS.standstill or self.steering_unpressed < int(1.5 / DT_CTRL):
+          self.silent_steer_warning += 1
+          if self.silent_steer_warning > 20:
+            events.add(EventName.steerTempUnavailableSilent)
         else:
           events.add(EventName.steerTempUnavailable)
     else:
       self.no_steer_warning = False
-      self.silent_steer_warning = False
+      self.silent_steer_warning = 0
     if CS.steerFaultPermanent:
       events.add(EventName.steerUnavailable)
 
@@ -265,4 +281,5 @@ class CarSpecificEvents:
         events.add(EventName.buttonCancel)
       if CS.softHoldActive > 0:
         events.add(EventName.softHold)
+
     return events

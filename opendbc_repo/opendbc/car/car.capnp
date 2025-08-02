@@ -214,6 +214,7 @@ struct CarState {
 
   # button presses
   buttonEvents @11 :List(ButtonEvent);
+  buttonEnable @57 :Bool;  # user is requesting enable, usually one frame. set if pcmCruise=False
   leftBlinker @20 :Bool;
   rightBlinker @21 :Bool;
   genericToggle @23 :Bool;
@@ -235,7 +236,6 @@ struct CarState {
   # process meta
   cumLagMs @50 :Float32;
 
-  tpms @57 : Tpms;
   vCluRatio @58 :Float32;
   logCarrot @59 :Text;
   softHoldActive @60 :Int16;    #0: not active, 1: active ready, 2: activated
@@ -244,7 +244,14 @@ struct CarState {
   pcmCruiseGap @63 :Int16;      #0: can't read, 1,2,3,4: gap setting
   speedLimit @64 :Float32;
   speedLimitDistance @65 :Float32;
-  gearStep @66 :Int16;
+  gearStep @66 :Int16;          
+  tpms @67 : Tpms;
+  useLaneLineSpeed @68 : Float32;
+  leftLatDist @69 : Float32;  # distance to left lane line
+  rightLatDist @70 : Float32; # distance to right lane line
+  leftLongDist @71 : Float32; # distance to left lane line in the direction of travel
+  rightLongDist @72 : Float32; # distance to right lane line in the direction of travel
+  carrotCruise @73 : Int16;
 
   struct Tpms {
     fl @0 :Float32;
@@ -304,6 +311,8 @@ struct CarState {
       gapAdjustCruise @11;
 
       lfaButton @12;
+      paddleLeft @13;
+      paddleRight @14;
     }
   }
 
@@ -319,13 +328,14 @@ struct CarState {
 # ******* radar state @ 20hz *******
 
 struct RadarData @0x888ad6581cf0aacb {
-  errors @0 :List(Error);
+  errors @3 :Error;
   points @1 :List(RadarPoint);
 
-  enum Error {
-    canError @0;
-    fault @1;
-    wrongConfig @2;
+  struct Error {
+    canError @0 :Bool;
+    radarFault @1 :Bool;
+    wrongConfig @2 :Bool;
+    radarUnavailableTemporary @3 :Bool;  # radar data is temporarily unavailable due to conditions the car sets
   }
 
   # similar to LiveTracks
@@ -344,10 +354,21 @@ struct RadarData @0x888ad6581cf0aacb {
 
     # some radars flag measurements VS estimates
     measured @6 :Bool;
+
+    vLead @7 :Float32; # m/s
+    aLead @8 :Float32; # m/s^2
+    jLead @9 :Float32; # m/s^3
+  }
+
+  enum ErrorDEPRECATED {
+    canError @0;
+    fault @1;
+    wrongConfig @2;
   }
 
   # deprecated
   canMonoTimesDEPRECATED @2 :List(UInt64);
+  errorsDEPRECATED @0 :List(ErrorDEPRECATED);
 }
 
 # ******* car controls @ 100hz *******
@@ -367,13 +388,14 @@ struct CarControl {
 
   orientationNED @13 :List(Float32);
   angularVelocity @14 :List(Float32);
+  currentCurvature @17 :Float32;  # From vehicle model
 
   cruiseControl @4 :CruiseControl;
   hudControl @5 :HUDControl;
 
   struct Actuators {
     # lateral commands, mutually exclusive
-    steer @2: Float32;  # [0.0, 1.0]
+    torque @2: Float32;  # [0.0, 1.0]
     steeringAngleDeg @3: Float32;
     curvature @7: Float32;
 
@@ -384,11 +406,12 @@ struct CarControl {
     # these are only for logging the actual values sent to the car over CAN
     gas @0: Float32;   # [0.0, 1.0]
     brake @1: Float32; # [0.0, 1.0]
-    steerOutputCan @8: Float32;   # value sent over can to the car
+    torqueOutputCan @8: Float32;   # value sent over can to the car
     speed @6: Float32;  # m/s
 
     jerk @9: Float32;  # m/s^3
-    aTargetNow @10: Float32;  # m/s^2
+    aTarget @10: Float32;  # m/s^2
+    yStd @11: Float32;  
 
     enum LongControlState @0xe40f3a917d908282{
       off @0;
@@ -421,6 +444,10 @@ struct CarControl {
     activeCarrot @11: Int16;
     leadDistance @12: Float32;
     leadRelSpeed @13: Float32;
+    leadDPath @14: Float32;
+    leadRadar @15: Int16;
+    modelDesire @16: Int16;
+    atcDistance @17: Float32;
 
     # not used with the dash, TODO: separate structs for dash UI and device UI
     audibleAlert @5: AudibleAlert;
@@ -477,6 +504,8 @@ struct CarControl {
       audio8 @31;
       audio9 @32;
       audio10 @33;
+
+      nnff @34;
     }
   }
 
@@ -509,15 +538,16 @@ struct CarParams {
   enableDsu @5 :Bool;        # driving support unit
   enableBsm @56 :Bool;       # blind spot monitoring
   flags @64 :UInt32;         # flags for car specific quirks
-  extFlags @77 :UInt32;     # carrot ext car flags
-  experimentalLongitudinalAvailable @71 :Bool;
+  alphaLongitudinalAvailable @71 :Bool;
+  extFlags @78 :UInt32;     # carrot ext car flags
 
   minEnableSpeed @7 :Float32;
   minSteerSpeed @8 :Float32;
+  steerAtStandstill @77 :Bool;  # is steering available at standstill? just check if it faults
   safetyConfigs @62 :List(SafetyConfig);
   alternativeExperience @65 :Int16;      # panda flag for features like no disengage on gas
 
-  # Car docs fields
+  # Car docs fields, not used for control
   maxLateralAccel @68 :Float32;
   autoResumeSng @69 :Bool;               # describes whether car can resume from a stop automatically
 
@@ -678,7 +708,8 @@ struct CarParams {
     chryslerCusw @30;
     psa @31;
     fcaGiorgio @32;
-    byd @33;
+    rivian @33;
+    volkswagenMeb @34;
   }
 
   enum SteerControlType {
@@ -775,5 +806,5 @@ struct CarParams {
   maxSteeringAngleDegDEPRECATED @54 :Float32;
   longitudinalActuatorDelayLowerBoundDEPRECATED @61 :Float32;
   stoppingControlDEPRECATED @31 :Bool; # Does the car allow full control even at lows speeds when stopping
-  radarTimeStepDEPRECATED @45: Float32 = 0.05;  # time delta between radar updates, 20Hz is very standard
+  radarTimeStep @45: Float32;  # time delta between radar updates, 20Hz is very standard
 }

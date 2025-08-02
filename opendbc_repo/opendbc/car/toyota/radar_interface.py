@@ -55,10 +55,8 @@ class RadarInterface(RadarInterfaceBase):
 
   def _update(self, updated_messages):
     ret = RadarData()
-    errors = []
     if not self.rcp.can_valid:
-      errors.append("canError")
-    ret.errors = errors
+      ret.errors.canError = True
 
     for ii in sorted(updated_messages):
       if ii in self.RADAR_A_MSGS:
@@ -83,6 +81,7 @@ class RadarInterface(RadarInterfaceBase):
           self.pts[ii].dRel = cpt['LONG_DIST']  # from front of car
           self.pts[ii].yRel = -cpt['LAT_DIST']  # in car frame's y axis, left is positive
           self.pts[ii].vRel = cpt['REL_SPEED']
+          self.pts[ii].vLead = self.pts[ii].vRel + self.v_ego
           self.pts[ii].aRel = float('nan')
           self.pts[ii].yvRel = float('nan')
           self.pts[ii].measured = bool(cpt['VALID'])

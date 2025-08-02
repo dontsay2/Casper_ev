@@ -6,10 +6,11 @@ from opendbc.can.packer import CANPacker
 from opendbc.car import Bus, DT_CTRL, apply_driver_steer_torque_limits, structs, create_gas_interceptor_command
 from opendbc.car.gm import gmcan
 from opendbc.car.common.conversions import Conversions as CV
-from opendbc.car.gm.values import DBC, CanBus, CarControllerParams, CruiseButtons, GMFlags, CC_ONLY_CAR, SDGM_CAR, EV_CAR, AccState, CC_REGEN_PADDLE_CAR, CAR
+from opendbc.car.gm.values import DBC, CanBus, CarControllerParams, CruiseButtons, GMFlags, CC_ONLY_CAR, EV_CAR, AccState, CC_REGEN_PADDLE_CAR, CAR
 from opendbc.car.interfaces import CarControllerBase
 from openpilot.selfdrive.controls.lib.drive_helpers import apply_deadzone
-from openpilot.selfdrive.controls.lib.vehicle_model import ACCELERATION_DUE_TO_GRAVITY
+from opendbc.car.vehicle_model import ACCELERATION_DUE_TO_GRAVITY
+from openpilot.selfdrive.car.cruise import VCruiseCarrot
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 NetworkLocation = structs.CarParams.NetworkLocation
@@ -29,7 +30,7 @@ class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP):
     super().__init__(dbc_names, CP)
     self.start_time = 0.
-    self.apply_steer_last = 0
+    self.apply_torque_last = 0
     self.apply_gas = 0
     self.apply_brake = 0
     self.apply_speed = 0 # kans: button spam
@@ -56,7 +57,7 @@ class CarController(CarControllerBase):
     self.accel_g = 0.0
     # GM: AutoResume
     self.activateCruise_after_brake = False
-    self.pressed_decel_button = False # Auto Cruise
+    self.v_cruise_carrot = VCruiseCarrot(self.CP)
 
   @staticmethod
   def calc_pedal_command(accel: float, long_active: bool, car_velocity) -> tuple[float, bool]:
@@ -129,25 +130,27 @@ class CarController(CarControllerBase):
         self.lka_steering_cmd_counter = CS.pt_lka_steering_cmd_counter + 1
 
       if CC.latActive:
-        new_steer = int(round(actuators.steer * self.params.STEER_MAX))
-        apply_steer = apply_driver_steer_torque_limits(new_steer, self.apply_steer_last, CS.out.steeringTorque, self.params)
+        new_torque = int(round(actuators.torque * self.params.STEER_MAX))
+        apply_torque = apply_driver_steer_torque_limits(new_torque, self.apply_torque_last, CS.out.steeringTorque, self.params)
       else:
-        apply_steer = 0
+        apply_torque = 0
 
       self.last_steer_frame = self.frame
-      self.apply_steer_last = apply_steer
+      self.apply_torque_last = apply_torque
       idx = self.lka_steering_cmd_counter % 4
-      can_sends.append(gmcan.create_steering_control(self.packer_pt, CanBus.POWERTRAIN, apply_steer, idx, CC.latActive))
+      can_sends.append(gmcan.create_steering_control(self.packer_pt, CanBus.POWERTRAIN, apply_torque, idx, CC.latActive))
 
     if self.CP.openpilotLongitudinalControl:
 
       if self.CP.carFingerprint in (CAR.CHEVROLET_VOLT):
+        button_counter = (CS.buttons_counter + 1) % 4
         # Auto Cruise
         if CS.out.activateCruise and not CS.out.cruiseState.enabled:
           self.activateCruise_after_brake = False # 오토크루즈가 되기 위해 브레이크 신호는 OFF여야 함.
-          if (self.frame - self.last_button_frame) * DT_CTRL > 0.04:  # 25Hz(40ms 버튼주기)
-            can_sends.append(gmcan.create_buttons(self.packer_pt, CanBus.POWERTRAIN, (CS.buttons_counter + 1) % 4, CruiseButtons.DECEL_SET))
+          if (self.frame - self.last_button_frame) * DT_CTRL > 0.04: # 25Hz(40ms 버튼주기)
             self.last_button_frame = self.frame
+            can_sends.append(gmcan.create_buttons(self.packer_pt, CanBus.POWERTRAIN, button_counter, CruiseButtons.DECEL_SET))
+
         # GM: AutoResume
         elif actuators.longControlState == LongCtrlState.starting:
           if CS.out.cruiseState.enabled and not self.activateCruise_after_brake: #브레이크신호 한번만 보내기 위한 조건.
@@ -155,15 +158,16 @@ class CarController(CarControllerBase):
             brake_force = -0.5  #롱컨캔슬을 위한 브레이크값(0.0 이하)
             apply_brake = self.brake_input(brake_force)
             # 브레이크신호 전송(롱컨 꺼짐)
-            can_sends.append(gmcan.create_brake_command(self.packer_pt, CanBus.POWERTRAIN, apply_brake, idx))
+            can_sends.append(gmcan.create_brake_command(self.packer_ch, CanBus.CHASSIS, apply_brake, idx))
             Params().put_bool_nonblocking("ActivateCruiseAfterBrake", True) # cruise.py에 브레이크 ON신호 전달
             self.activateCruise_after_brake = True # 브레이크신호는 한번만 보내고 초기화
       else:
-        if CS.out.activateCruise and not CS.out.cruiseState.enabled:
-          if (self.frame - self.last_button_frame) * DT_CTRL > 0.04 and not self.pressed_decel_button:  # 25Hz(40ms 버튼주기)
-            can_sends.append(gmcan.create_buttons(self.packer_pt, CanBus.POWERTRAIN, (CS.buttons_counter + 1) % 4, CruiseButtons.DECEL_SET))
+        auto_cruise_control = self.v_cruise_carrot.autoCruiseControl
+        if (CS.out.activateCruise or auto_cruise_control > 0) and \
+           not CS.out.cruiseState.enabled:
+          if (self.frame - self.last_button_frame) * DT_CTRL > 0.04:
             self.last_button_frame = self.frame
-            self.pressed_decel_button = True # 버튼신호는 한번만 보내고 초기화
+            can_sends.append(gmcan.create_buttons(self.packer_pt, CanBus.POWERTRAIN, (CS.buttons_counter + 1) % 4, CruiseButtons.DECEL_SET))
         
       # Gas/regen, brakes, and UI commands - all at 25Hz
       if self.frame % 4 == 0:
@@ -245,10 +249,9 @@ class CarController(CarControllerBase):
             acc_engaged = CC.enabled
 
           if actuators.longControlState in [LongCtrlState.stopping, LongCtrlState.starting]:
-            if (self.frame - self.last_button_frame) * DT_CTRL > 0.2:
+            if (self.frame - self.last_button_frame) * DT_CTRL > 0.04:
               self.last_button_frame = self.frame
-              for i in range(12):
-                can_sends.append(gmcan.create_buttons(self.packer_pt, CanBus.POWERTRAIN, CS.buttons_counter, CruiseButtons.RES_ACCEL))
+              can_sends.append(gmcan.create_buttons(self.packer_pt, CanBus.POWERTRAIN, (CS.buttons_counter + 1) % 4, CruiseButtons.RES_ACCEL))
           # GasRegenCmdActive needs to be 1 to avoid cruise faults. It describes the ACC state, not actuation
           can_sends.append(gmcan.create_gas_regen_command(self.packer_pt, CanBus.POWERTRAIN, self.apply_gas, idx, acc_engaged, at_full_stop))
           can_sends.append(gmcan.create_friction_brake_command(self.packer_ch, friction_brake_bus, self.apply_brake,
@@ -299,10 +302,7 @@ class CarController(CarControllerBase):
       if (self.frame - self.last_button_frame) * DT_CTRL > 0.04:
         if self.cancel_counter > CAMERA_CANCEL_DELAY_FRAMES:
           self.last_button_frame = self.frame
-          if self.CP.carFingerprint in SDGM_CAR:
-            can_sends.append(gmcan.create_buttons(self.packer_pt, CanBus.POWERTRAIN, CS.buttons_counter, CruiseButtons.CANCEL))
-          else:
-            can_sends.append(gmcan.create_buttons(self.packer_pt, CanBus.CAMERA, CS.buttons_counter, CruiseButtons.CANCEL))
+          can_sends.append(gmcan.create_buttons(self.packer_pt, CanBus.CAMERA, CS.buttons_counter, CruiseButtons.CANCEL))
 
     if self.CP.networkLocation == NetworkLocation.fwdCamera:
       # Silence "Take Steering" alert sent by camera, forward PSCMStatus with HandsOffSWlDetectionStatus=1
@@ -311,8 +311,8 @@ class CarController(CarControllerBase):
 
     new_actuators = actuators.as_builder()
     new_actuators.accel = accel
-    new_actuators.steer = self.apply_steer_last / self.params.STEER_MAX
-    new_actuators.steerOutputCan = self.apply_steer_last
+    new_actuators.torque = self.apply_torque_last / self.params.STEER_MAX
+    new_actuators.torqueOutputCan = self.apply_torque_last
     new_actuators.gas = self.apply_gas
     new_actuators.brake = self.apply_brake
     new_actuators.speed = self.apply_speed # kans: button spam

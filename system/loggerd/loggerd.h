@@ -35,6 +35,7 @@ public:
   const char *thumbnail_name = NULL;
   const char *filename = NULL;
   bool record = true;
+  bool include_audio = false;
   int frame_width = -1;
   int frame_height = -1;
   int fps = MAIN_FPS;
@@ -56,22 +57,23 @@ public:
 
 const EncoderInfo main_road_encoder_info = {
   .publish_name = "roadEncodeData",
+  .thumbnail_name = "thumbnail",
   .filename = "fcamera.hevc",
-  .record = false,
+  .record = Params().getInt("RecordRoadCam") > 0,
   INIT_ENCODE_FUNCTIONS(RoadEncode),
 };
 
 const EncoderInfo main_wide_road_encoder_info = {
   .publish_name = "wideRoadEncodeData",
   .filename = "ecamera.hevc",
-  .record = false,
+  .record = Params().getInt("RecordRoadCam") > 1,
   INIT_ENCODE_FUNCTIONS(WideRoadEncode),
 };
 
 const EncoderInfo main_driver_encoder_info = {
   .publish_name = "driverEncodeData",
   .filename = "dcamera.hevc",
-  .record = false, //Params().getBool("RecordFront"),
+  .record = Params().getBool("RecordFront"),
   INIT_ENCODE_FUNCTIONS(DriverEncode),
 };
 
@@ -107,6 +109,7 @@ const EncoderInfo qcam_encoder_info = {
   .encode_type = cereal::EncodeIndex::Type::QCAMERA_H264,
   .frame_width = 526,
   .frame_height = 330,
+  .include_audio = Params().getBool("RecordAudio"),
   INIT_ENCODE_FUNCTIONS(QRoadEncode),
 };
 

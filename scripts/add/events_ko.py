@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 import bisect
 import math
 import os
@@ -8,6 +8,7 @@ from collections.abc import Callable
 from cereal import log, car
 import cereal.messaging as messaging
 from openpilot.common.conversions import Conversions as CV
+from openpilot.common.params import Params
 from openpilot.common.git import get_short_branch
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.locationd.calibrationd import MIN_SPEED_FILTER
@@ -251,6 +252,20 @@ def calibration_incomplete_alert(CP: car.CarParams, CS: car.CarState, sm: messag
     AlertStatus.normal, AlertSize.mid,
     Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .2)
 
+def torque_nn_load_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
+  model_name = Params().get("NNFFModelName", encoding='utf-8')
+  if model_name == "":
+    return Alert(
+      "NNFF Torque Controller not available",
+      "Donate logs to Twilsonco to get it added!",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 6.0)
+  else:
+    return Alert(
+      "NNFF Torque Controller loaded",
+      model_name,
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 5.0)
 
 # *** debug alerts ***
 
@@ -314,7 +329,7 @@ def modeld_lagging_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubM
 
 def wrong_car_mode_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
   text = "크루즈 버튼으로 활성화됩니다"
-  if CP.carName == "honda":
+  if CP.brand == "honda":
     text = "메인 스위치로 활성화됩니다"
   return NoEntryAlert(text)
 
@@ -340,6 +355,16 @@ def personality_changed_alert(CP: car.CarParams, CS: car.CarState, sm: messaging
   personality = str(personality).title()
   return NormalPermanentAlert(f"Driving Personality: {personality}", duration=1.5)
 
+def car_parser_result(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
+  results = Params().get("CanParserResult")
+  if results is None:
+    results = ""
+  return Alert(
+    "CAN 오류: Check Connections",
+    results,
+    AlertStatus.normal, AlertSize.small,
+    Priority.LOW, VisualAlert.none, AudibleAlert.none, 1., creation_delay=1.)
+  
 
 
 EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
@@ -453,7 +478,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "조향제어 일시적 불가능",
       "",
       AlertStatus.userPrompt, AlertSize.small,
-      Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 1.8),
+      Priority.LOW, VisualAlert.steerRequired, AudibleAlert.none, 1.8),
   },
 
   EventName.preDriverDistracted: {
@@ -561,7 +586,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "핸들을 잡아주세요",
       "회전이 조향 한도를 초과함",
       AlertStatus.userPrompt, AlertSize.mid,
-      Priority.LOW, VisualAlert.steerRequired, AudibleAlert.promptRepeat, 2.),
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
   },
 
   # Thrown when the fan is driven at >50% but is not rotating
@@ -763,24 +788,13 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   EventName.doorOpen: {
-    #ET.SOFT_DISABLE: user_soft_disable_alert("Door Open"),
-    ET.USER_DISABLE: EngagementAlert(AudibleAlert.disengage),
+    ET.SOFT_DISABLE: user_soft_disable_alert("도어 열림"),
     ET.NO_ENTRY: NoEntryAlert("도어 열림"),
-    ET.PERMANENT: Alert(
-      "도어 열림",
-      "",
-      AlertStatus.normal, AlertSize.full,
-      Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .2, creation_delay=0.5),
   },
 
   EventName.seatbeltNotLatched: {
     ET.SOFT_DISABLE: user_soft_disable_alert("안전벨트를 착용해주세요"),
     ET.NO_ENTRY: NoEntryAlert("안전벨트를 착용해주세요"),
-    ET.PERMANENT: Alert(
-      "안전벨트 미착용",
-      "",
-      AlertStatus.normal, AlertSize.full,
-      Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .2, creation_delay=0.5),
   },
 
   EventName.espDisabled: {
@@ -883,22 +897,24 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # - CAN data is received, but some message are not received at the right frequency
   # If you're not writing a new car port, this is usually cause by faulty wiring
   EventName.canError: {
+    ET.PERMANENT: car_parser_result,
     ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("CAN 오류 : 장치를 점검하세요"),
-    ET.PERMANENT: Alert(
-      "CAN 오류 : 장치를 점검하세요",
-      "",
-      AlertStatus.normal, AlertSize.small,
-      Priority.LOW, VisualAlert.none, AudibleAlert.none, 1., creation_delay=1.),
+    #ET.PERMANENT: Alert(
+    #  "CAN 오류 : 장치를 점검하세요",
+    #  "",
+    #  AlertStatus.normal, AlertSize.small,
+    #  Priority.LOW, VisualAlert.none, AudibleAlert.none, 1., creation_delay=1.),
     ET.NO_ENTRY: NoEntryAlert("CAN 오류 : 장치를 점검하세요"),
   },
 
   EventName.canBusMissing: {
+    ET.PERMANENT: car_parser_result,
     ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("CAN Bus 연결 끈김"),
-    ET.PERMANENT: Alert(
-      "CAN Bus 오류 : 케이블을 점검하세요",
-      "",
-      AlertStatus.normal, AlertSize.small,
-      Priority.LOW, VisualAlert.none, AudibleAlert.none, 1., creation_delay=1.),
+    #ET.PERMANENT: Alert(
+    #  "CAN Bus 오류 : 케이블을 점검하세요",
+    #  "",
+    #  AlertStatus.normal, AlertSize.small,
+    #  Priority.LOW, VisualAlert.none, AudibleAlert.none, 1., creation_delay=1.),
     ET.NO_ENTRY: NoEntryAlert("CAN Bus 오류 : 장치를 점검하세요"),
   },
 
@@ -964,7 +980,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventName.softHold: {
     ET.WARNING: Alert(
-      "SoftHold 동작",
+      "SoftHold",
       "",
       AlertStatus.normal, AlertSize.small,
       Priority.LOW, VisualAlert.none, AudibleAlert.none, .1),
@@ -1054,6 +1070,9 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
   EventName.audio0: {
      ET.WARNING: EngagementAlert(AudibleAlert.longDisengaged),
+  },
+  EventName.torqueNNLoad: {
+    ET.PERMANENT: torque_nn_load_alert,
   },
 
 }

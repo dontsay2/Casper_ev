@@ -70,6 +70,7 @@ class LanePlanner:
     self.lane_offset_filtered = FirstOrderFilter(0.0, 2.0, DT_MDL)
 
     self.lanefull_mode = False
+    self.d_prob_count = 0
 
     self.params = Params()
 
@@ -158,7 +159,7 @@ class LanePlanner:
       #self.lane_width_right_filtered.x = self.lane_width_right #바로적용
 
     self.adjustLaneOffset = float(self.params.get_int("AdjustLaneOffset")) * 0.01
-    self.adjustCurveOffset = float(self.params.get_int("AdjustCurveOffset")) * 0.01
+    self.adjustCurveOffset = self.adjustLaneOffset #float(self.params.get_int("AdjustCurveOffset")) * 0.01
     ADJUST_OFFSET_LIMIT = 0.4 #max(self.adjustLaneOffset, self.adjustCurveOffset)
     offset_curve = 0.0
     ## curve offset
@@ -229,16 +230,19 @@ class LanePlanner:
     #  self.d_prob, self.lanefull_mode,
     #  self.lane_width_left_filtered.x, self.lane_width, self.lane_width_right_filtered.x)
 
-    adjustLaneTime = self.params.get_int("AdjustLaneTime")
-    if self.lanefull_mode:
-      use_dist_mode = True  ## 아무리생각해봐도.. 같은 방법인듯...
+    adjustLaneTime = self.params.get_float("LatMpcInputOffset") * 0.01 # 0.06 
+    laneline_active = False
+    self.d_prob_count = self.d_prob_count + 1 if self.d_prob > 0.3 else 0
+    if self.lanefull_mode and self.d_prob_count > int(1 / DT_MDL):
+      laneline_active = True
+      use_dist_mode = False  ## 아무리생각해봐도.. 같은 방법인듯...
       if use_dist_mode:
-        lane_path_y_interp = np.interp(path_xyz[:,0] + v_ego * adjustLaneTime*0.01, self.ll_x, lane_path_y)
+        lane_path_y_interp = np.interp(path_xyz[:,0] + v_ego * adjustLaneTime, self.ll_x, lane_path_y)
         path_xyz[:,1] = self.d_prob * lane_path_y_interp + (1.0 - self.d_prob) * path_xyz[:,1]
       else:
         safe_idxs = np.isfinite(self.ll_t)
         if safe_idxs[0]:
-          lane_path_y_interp = np.interp(path_t * (1.0 + adjustLaneTime*0.01), self.ll_t[safe_idxs], lane_path_y[safe_idxs])
+          lane_path_y_interp = np.interp(path_t * (1.0 + adjustLaneTime), self.ll_t[safe_idxs], lane_path_y[safe_idxs])
           path_xyz[:,1] = self.d_prob * lane_path_y_interp + (1.0 - self.d_prob) * path_xyz[:,1]
 
 
@@ -246,21 +250,42 @@ class LanePlanner:
 
     self.offset_total = self.lane_offset_filtered.x
 
-    return path_xyz
+    return path_xyz, laneline_active
 
   def calculate_plan_yaw_and_yaw_rate(self, path_xyz):
+    if path_xyz.shape[0] < 3:
+        # 너무 짧으면 직진 가정
+        N = path_xyz.shape[0]
+        return np.zeros(N), np.zeros(N)
+
+    # x, y 추출
     x = path_xyz[:, 0]
     y = path_xyz[:, 1]
 
-    # yaw 계산
-    yaw = np.arctan2(np.diff(y), np.diff(x))  # 각도 계산 (길이: N-1)
-    yaw = np.append(yaw, yaw[-1])  # 마지막 점의 yaw 보정 (길이: N)
+    # 모두 동일한 점인지 확인
+    if np.allclose(x, x[0]) and np.allclose(y, y[0]):
+        return np.zeros(len(x)), np.zeros(len(x))
 
-    # yaw_rate 계산 (yaw 변화율)
+    # 안전한 diff 계산
     dx = np.diff(x)
-    dx = np.where(dx == 0, 1e-6, dx)  # 0으로 나누는 경우 방지
-    yaw_rate = np.diff(yaw) / dx  # yaw 변화율 계산 (길이: N-2)
-    yaw_rate = np.append(yaw_rate, yaw_rate[-1])  # 마지막 점의 yaw_rate 보정 (길이: N-1)
-    yaw_rate = np.append(yaw_rate, 0.0)  # 최종적으로 길이를 N으로 맞춤
+    dy = np.diff(y)
+    mask = (dx == 0) & (dy == 0)
+    dx[mask] = 1e-4
+    dy[mask] = 0.0
+
+    yaw = np.arctan2(dy, dx)
+    yaw = np.append(yaw, yaw[-1])  # N-1 → N
+    yaw = np.unwrap(yaw)
+
+    dx_full = np.clip(np.diff(x), 1e-4, None)
+    yaw_rate = np.diff(yaw) / dx_full
+    yaw_rate = np.append(yaw_rate, yaw_rate[-1])
+    yaw_rate = np.append(yaw_rate, 0.0)
+
+    # NaN/Inf 방어
+    if np.any(np.isnan(yaw_rate)) or np.any(np.isinf(yaw_rate)):
+        yaw_rate = np.zeros_like(yaw_rate)
+    if np.any(np.isnan(yaw)) or np.any(np.isinf(yaw)):
+        yaw = np.zeros_like(yaw)
 
     return yaw, yaw_rate

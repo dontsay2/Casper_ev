@@ -57,6 +57,9 @@ def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
+def enable_updated(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return not started and params.get_bool("SoftwareMenu")
+
 def check_fleet(started, params, CP: car.CarParams) -> bool:
   return FLASK_AVAILABLE
 
@@ -66,24 +69,31 @@ def or_(*fns):
 def and_(*fns):
   return lambda *args: operator.and_(*(fn(*args) for fn in fns))
 
+def enable_dm(started, params, CP: car.CarParams) -> bool:
+  return (started or params.get_bool("IsDriverViewEnabled")) and params.get_int("DisableDM") == 0
+
+def enable_connect(started, params, CP: car.CarParams) -> bool:
+  return params.get_int("EnableConnect") > 0
+
 procs = [
   DaemonProcess("manage_athenad", "system.athena.manage_athenad", "AthenadPid"),
+
+  NativeProcess("loggerd", "system/loggerd", ["./loggerd"], logging),
+  NativeProcess("encoderd", "system/loggerd", ["./encoderd"], only_onroad),
+  NativeProcess("stream_encoderd", "system/loggerd", ["./encoderd", "--stream"], notcar),
+  PythonProcess("logmessaged", "system.logmessaged", always_run),
 
   NativeProcess("camerad", "system/camerad", ["./camerad"], driverview, enabled=not WEBCAM),
   PythonProcess("webcamerad", "tools.webcam.camerad", driverview, enabled=WEBCAM),
   NativeProcess("logcatd", "system/logcatd", ["./logcatd"], only_onroad),
   NativeProcess("proclogd", "system/proclogd", ["./proclogd"], only_onroad),
-  PythonProcess("logmessaged", "system.logmessaged", always_run),
   PythonProcess("micd", "system.micd", iscar),
   PythonProcess("timed", "system.timed", always_run, enabled=not PC),
 
-  # TODO Make python process once TG allows opening QCOM from child proc
-  NativeProcess("dmonitoringmodeld", "selfdrive/modeld", ["./dmonitoringmodeld"], driverview, enabled=(WEBCAM or not PC)),
-  NativeProcess("encoderd", "system/loggerd", ["./encoderd"], only_onroad),
-  NativeProcess("stream_encoderd", "system/loggerd", ["./encoderd", "--stream"], notcar),
-  NativeProcess("loggerd", "system/loggerd", ["./loggerd"], logging),
-  # TODO Make python process once TG allows opening QCOM from child proc
-  NativeProcess("modeld", "selfdrive/modeld", ["./modeld"], only_onroad),
+  # TODO: Make python process once TG allows opening QCOM from child pro
+  # https://github.com/tinygrad/tinygrad/blob/ac9c96dae1656dc220ee4acc39cef4dd449aa850/tinygrad/device.py#L26
+  NativeProcess("modeld", "selfdrive/modeld", ["./modeld.py"], only_onroad),
+  NativeProcess("dmonitoringmodeld", "selfdrive/modeld", ["./dmonitoringmodeld.py"], enable_dm, enabled=(WEBCAM or not PC)),
   #NativeProcess("mapsd", "selfdrive/navd", ["./mapsd"], only_onroad),
   #NativeProcess("mapsd", "selfdrive/navd", ["./mapsd"], always_run),
   #PythonProcess("navmodeld", "selfdrive.modeld.navmodeld", only_onroad),
@@ -100,10 +110,12 @@ procs = [
   PythonProcess("selfdrived", "selfdrive.selfdrived.selfdrived", only_onroad),
   PythonProcess("card", "selfdrive.car.card", only_onroad),
   PythonProcess("deleter", "system.loggerd.deleter", always_run),
-  PythonProcess("dmonitoringd", "selfdrive.monitoring.dmonitoringd", driverview, enabled=(WEBCAM or not PC)),
+  PythonProcess("dmonitoringd", "selfdrive.monitoring.dmonitoringd", enable_dm, enabled=(WEBCAM or not PC)),
   PythonProcess("qcomgpsd", "system.qcomgpsd.qcomgpsd", qcomgps, enabled=TICI),
+  PythonProcess("navd", "selfdrive.navd.navd", only_onroad),
   PythonProcess("pandad", "selfdrive.pandad.pandad", always_run),
   PythonProcess("paramsd", "selfdrive.locationd.paramsd", only_onroad),
+  PythonProcess("lagd", "selfdrive.locationd.lagd", only_onroad),
   NativeProcess("ubloxd", "system/ubloxd", ["./ubloxd"], ublox, enabled=TICI),
   PythonProcess("pigeond", "system.ubloxd.pigeond", ublox, enabled=TICI),
   PythonProcess("plannerd", "selfdrive.controls.plannerd", not_long_maneuver),
@@ -111,8 +123,8 @@ procs = [
   PythonProcess("radard", "selfdrive.controls.radard", only_onroad),
   PythonProcess("hardwared", "system.hardware.hardwared", always_run),
   PythonProcess("tombstoned", "system.tombstoned", always_run, enabled=not PC),
-  PythonProcess("updated", "system.updated.updated", only_offroad, enabled=not PC),
-  #PythonProcess("uploader", "system.loggerd.uploader", always_run),
+  PythonProcess("updated", "system.updated.updated", enable_updated, enabled=not PC),
+  PythonProcess("uploader", "system.loggerd.uploader", enable_connect),
   PythonProcess("statsd", "system.statsd", always_run),
 
   # debug procs

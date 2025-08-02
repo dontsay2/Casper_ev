@@ -28,6 +28,7 @@ Sidebar::Sidebar(QWidget *parent) : QFrame(parent), onroad(false), flag_pressed(
   home_img = loadPixmap("../assets/images/button_home.png", home_btn.size());
   flag_img = loadPixmap("../assets/images/button_flag.png", home_btn.size());
   settings_img = loadPixmap("../assets/images/button_settings.png", settings_btn.size(), Qt::IgnoreAspectRatio);
+  c3x_img = loadPixmap("../assets/img_c3x.png", home_btn.size());
 
   connect(this, &Sidebar::valueChanged, [=] { update(); });
 
@@ -81,31 +82,23 @@ void Sidebar::updateState(const UIState &s) {
   int strength = tethering_on ? 4 : (int)deviceState.getNetworkStrength();
   setProperty("netStrength", strength > 0 ? strength + 1 : 0);
 
-  if (sm.frame % UI_FREQ == 0) { // Update every 1 Hz
-    sidebar_temp = QString::number((int)deviceState.getMaxTempC());
-    setProperty("sidebarTemp", sidebar_temp + "°C");
-
-    gpu_usage = QString::number((int)deviceState.getMemoryUsagePercent());
-    setProperty("gpuUsage", gpu_usage + "%");
-  }
-
   ItemStatus connectStatus;
-  //auto last_ping = deviceState.getLastAthenaPingTime();
-  //if (last_ping == 0) {
-    connectStatus = ItemStatus{{tr("MEM"), gpu_usage_str}, good_color};
-  //} else {
-  //  connectStatus = nanos_since_boot() - last_ping < 80e9
-  //                      ? ItemStatus{{tr("GPU"), tr("ONLINE")}, good_color}
-  //                      : ItemStatus{{tr("GPU"), tr("ERROR")}, danger_color};
-  //}
+  auto last_ping = deviceState.getLastAthenaPingTime();
+  if (last_ping == 0) {
+    connectStatus = ItemStatus{{tr("CONNECT"), tr("OFFLINE")}, warning_color};
+  } else {
+    connectStatus = nanos_since_boot() - last_ping < 80e9
+                        ? ItemStatus{{tr("CONNECT"), tr("ONLINE")}, good_color}
+                        : ItemStatus{{tr("CONNECT"), tr("ERROR")}, danger_color};
+  }
   setProperty("connectStatus", QVariant::fromValue(connectStatus));
 
-  ItemStatus tempStatus = {{tr("TEMP"), sidebar_temp_str}, danger_color};
+  ItemStatus tempStatus = {{tr("TEMP"), tr("HIGH")}, danger_color};
   auto ts = deviceState.getThermalStatus();
   if (ts == cereal::DeviceState::ThermalStatus::GREEN) {
-    tempStatus = {{tr("TEMP"), sidebar_temp_str}, good_color};
+    tempStatus = {{tr("TEMP"), tr("GOOD")}, good_color};
   } else if (ts == cereal::DeviceState::ThermalStatus::YELLOW) {
-    tempStatus = {{tr("TEMP"), sidebar_temp_str}, warning_color};
+    tempStatus = {{tr("TEMP"), tr("OK")}, warning_color};
   }
   setProperty("tempStatus", QVariant::fromValue(tempStatus));
 
@@ -123,11 +116,20 @@ void Sidebar::paintEvent(QPaintEvent *event) {
 
   p.fillRect(rect(), QColor(57, 57, 57));
 
+  QString c3x_position = QString("%1").arg(QString::fromStdString(params.get("DevicePosition")));
+
   // buttons
   p.setOpacity(settings_pressed ? 0.65 : 1.0);
   p.drawPixmap(settings_btn.x(), settings_btn.y(), settings_img);
   p.setOpacity(onroad && flag_pressed ? 0.65 : 1.0);
-  p.drawPixmap(home_btn.x(), home_btn.y(), onroad ? flag_img : home_img);
+  //p.drawPixmap(home_btn.x(), home_btn.y(), onroad ? flag_img : home_img);
+  p.drawPixmap(home_btn.x(), home_btn.y(), c3x_img);
+
+  const QRect r3 = QRect(0, 967, event->rect().width(), 50);
+  p.setFont(InterFont(30));
+  p.setPen(QColor(0xff, 0xff, 0xff));
+  p.drawText(r3, Qt::AlignCenter, c3x_position);
+
   p.setOpacity(1.0);
 
   // network

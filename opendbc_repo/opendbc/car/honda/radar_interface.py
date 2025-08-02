@@ -60,6 +60,7 @@ class RadarInterface(RadarInterfaceBase):
         self.pts[ii].dRel = cpt['LONG_DIST']  # from front of car
         self.pts[ii].yRel = -cpt['LAT_DIST']  # in car frame's y axis, left is positive
         self.pts[ii].vRel = cpt['REL_SPEED']
+        self.pts[ii].vLead = self.pts[ii].vRel + self.v_ego
         self.pts[ii].aRel = float('nan')
         self.pts[ii].yvRel = float('nan')
         self.pts[ii].measured = True
@@ -67,14 +68,12 @@ class RadarInterface(RadarInterfaceBase):
         if ii in self.pts:
           del self.pts[ii]
 
-    errors = []
     if not self.rcp.can_valid:
-      errors.append("canError")
+      ret.errors.canError = True
     if self.radar_fault:
-      errors.append("fault")
+      ret.errors.radarFault = True
     if self.radar_wrong_config:
-      errors.append("wrongConfig")
-    ret.errors = errors
+      ret.errors.wrongConfig = True
 
     ret.points = list(self.pts.values())
 

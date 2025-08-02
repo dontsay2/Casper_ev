@@ -1,13 +1,14 @@
 import os
 import time
 
-from opendbc.car import carlog, gen_empty_fingerprint
+from opendbc.car import gen_empty_fingerprint
 from opendbc.car.can_definitions import CanRecvCallable, CanSendCallable
+from opendbc.car.carlog import carlog
 from opendbc.car.structs import CarParams, CarParamsT
 from opendbc.car.fingerprints import eliminate_incompatible_cars, all_legacy_fingerprint_cars
 from opendbc.car.fw_versions import ObdCallback, get_fw_versions_ordered, get_present_ecus, match_fw_to_car
-from opendbc.car.interfaces import get_interface_attr
 from opendbc.car.mock.values import CAR as MOCK
+from opendbc.car.values import BRANDS
 from opendbc.car.vin import get_vin, is_valid_vin, VIN_UNKNOWN
 
 from common.params import Params
@@ -21,19 +22,17 @@ def load_interfaces(brand_names):
   for brand_name in brand_names:
     path = f'opendbc.car.{brand_name}'
     CarInterface = __import__(path + '.interface', fromlist=['CarInterface']).CarInterface
-    CarState = __import__(path + '.carstate', fromlist=['CarState']).CarState
-    CarController = __import__(path + '.carcontroller', fromlist=['CarController']).CarController
-    RadarInterface = __import__(path + '.radar_interface', fromlist=['RadarInterface']).RadarInterface
     for model_name in brand_names[brand_name]:
-      ret[model_name] = (CarInterface, CarController, CarState, RadarInterface)
+      ret[model_name] = CarInterface
   return ret
 
 
 def _get_interface_names() -> dict[str, list[str]]:
   # returns a dict of brand name and its respective models
   brand_names = {}
-  for brand_name, brand_models in get_interface_attr("CAR").items():
-    brand_names[brand_name] = [model.value for model in brand_models]
+  for brand in BRANDS:
+    brand_name = brand.__module__.split('.')[-2]
+    brand_names[brand_name] = [model.value for model in brand]
 
   return brand_names
 
@@ -152,17 +151,7 @@ def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_mu
   return car_fingerprint, finger, vin, car_fw, source, exact_match
 
 
-def get_car_interface(CP: CarParams):
-  CarInterface, CarController, CarState, _ = interfaces[CP.carFingerprint]
-  return CarInterface(CP, CarController, CarState)
-
-
-def get_radar_interface(CP: CarParams):
-  _, _, _, RadarInterface = interfaces[CP.carFingerprint]
-  return RadarInterface(CP)
-
-
-def get_car(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_multiplexing: ObdCallback, experimental_long_allowed: bool,
+def get_car(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_multiplexing: ObdCallback, alpha_long_allowed: bool,
             num_pandas: int = 1, cached_params: CarParamsT | None = None):
   candidate, fingerprints, vin, car_fw, source, exact_match = fingerprint(can_recv, can_send, set_obd_multiplexing, num_pandas, cached_params)
 
@@ -173,15 +162,10 @@ def get_car(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_multip
   selected_car = Params().get("CarSelected3")
   if selected_car:
     def find_car(name: str):
-      from opendbc.car.byd.values import CAR as BYD
       from opendbc.car.hyundai.values import CAR as HYUNDAI
       from opendbc.car.gm.values import CAR as GM
       from opendbc.car.toyota.values import CAR as TOYOTA
       from opendbc.car.mazda.values import CAR as MAZDA
-      for platform in BYD:
-        for doc in platform.config.car_docs:
-          if name == doc.name:
-            return platform
       for platform in GM:
         for doc in platform.config.car_docs:
           if name == doc.name:
@@ -205,9 +189,9 @@ def get_car(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_multip
 
   print(f"SelectedCar = {candidate}")
   Params().put("CarName", candidate)
-
-  CarInterface, _, _, _ = interfaces[candidate]
-  CP: CarParams = CarInterface.get_params(candidate, fingerprints, car_fw, experimental_long_allowed, docs=False)
+  
+  CarInterface = interfaces[candidate]
+  CP: CarParams = CarInterface.get_params(candidate, fingerprints, car_fw, alpha_long_allowed, docs=False)
   CP.carVin = vin
   CP.carFw = car_fw
   CP.fingerprintSource = source
@@ -215,11 +199,11 @@ def get_car(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_multip
 
   print("Carrot GitBranch = {}, {}".format(Params().get("GitBranch"), Params().get("GitCommitDate")))
 
-  return get_car_interface(CP)
+  return interfaces[CP.carFingerprint](CP)
 
 
 def get_demo_car_params():
   platform = MOCK.MOCK
-  CarInterface, _, _, _ = interfaces[platform]
+  CarInterface = interfaces[platform]
   CP = CarInterface.get_non_essential_params(platform)
   return CP

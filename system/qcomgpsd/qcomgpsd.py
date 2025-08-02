@@ -240,8 +240,11 @@ def main() -> NoReturn:
     cloudlog.warning("caught sig disabling quectel gps")
 
     gpio_set(GPIO.GNSS_PWR_EN, False)
-    teardown_quectel(diag)
-    cloudlog.warning("quectel cleanup done")
+    try:
+      teardown_quectel(diag)
+      cloudlog.warning("quectel cleanup done")
+    except NameError:
+      cloudlog.warning('quectel not yet setup')
 
     stop_download_event.set()
     assist_fetch_proc.kill()
@@ -270,6 +273,7 @@ def main() -> NoReturn:
     if opcode != DIAG_LOG_F:
       cloudlog.error(f"Unhandled opcode: {opcode}")
       continue
+
     (pending_msgs, log_outer_length), inner_log_packet = unpack_from('<BH', payload), payload[calcsize('<BH'):]
     if pending_msgs > 0:
       cloudlog.debug(f"have {pending_msgs} pending messages")
@@ -329,7 +333,9 @@ def main() -> NoReturn:
       pm.send('qcomGnss', msg)
     elif log_type == LOG_GNSS_POSITION_REPORT:
       report = unpack_position(log_payload)
+      #print(report)
       if report["u_PosSource"] != 2:
+        print("u_PosSource =", report["u_PosSource"])
         continue
       vNED = [report["q_FltVelEnuMps[1]"], report["q_FltVelEnuMps[0]"], -report["q_FltVelEnuMps[2]"]]
       vNEDsigma = [report["q_FltVelSigmaMps[1]"], report["q_FltVelSigmaMps[0]"], -report["q_FltVelSigmaMps[2]"]]

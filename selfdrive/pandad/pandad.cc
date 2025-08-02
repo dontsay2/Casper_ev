@@ -11,7 +11,6 @@
 
 #include "cereal/gen/cpp/car.capnp.h"
 #include "cereal/messaging/messaging.h"
-#include "common/params.h"
 #include "common/ratekeeper.h"
 #include "common/swaglog.h"
 #include "common/timing.h"
@@ -189,7 +188,7 @@ void fill_panda_can_state(cereal::PandaState::PandaCanState::Builder &cs, const 
   cs.setCanCoreResetCnt(can_health.can_core_reset_cnt);
 }
 
-std::optional<bool> send_panda_states(PubMaster *pm, const std::vector<Panda *> &pandas, bool spoofing_started, Params &params) {
+std::optional<bool> send_panda_states(PubMaster *pm, const std::vector<Panda *> &pandas, bool spoofing_started) {
   bool ignition_local = false;
   const uint32_t pandas_cnt = pandas.size();
 
@@ -237,7 +236,7 @@ std::optional<bool> send_panda_states(PubMaster *pm, const std::vector<Panda *> 
       health.ignition_line_pkt = 0;
     }
 
-    ignition_local |= (((health.ignition_line_pkt != 0) || (health.ignition_can_pkt != 0))) && !params.getBool("ForceOffroad");
+    ignition_local |= ((health.ignition_line_pkt != 0) || (health.ignition_can_pkt != 0));
 
     pandaStates.push_back(health);
   }
@@ -324,14 +323,14 @@ void send_peripheral_state(Panda *panda, PubMaster *pm) {
   pm->send("peripheralState", msg);
 }
 
-void process_panda_state(std::vector<Panda *> &pandas, PubMaster *pm, bool engaged, bool spoofing_started, Params &params) {
+void process_panda_state(std::vector<Panda *> &pandas, PubMaster *pm, bool engaged, bool spoofing_started) {
   std::vector<std::string> connected_serials;
   for (Panda *p : pandas) {
     connected_serials.push_back(p->hw_serial());
   }
 
   {
-    auto ignition_opt = send_panda_states(pm, pandas, spoofing_started, params);
+    auto ignition_opt = send_panda_states(pm, pandas, spoofing_started);
     if (!ignition_opt) {
       LOGE("Failed to get ignition_opt");
       return;
@@ -360,7 +359,7 @@ void process_panda_state(std::vector<Panda *> &pandas, PubMaster *pm, bool engag
       }
     }
 
-   for (const auto &panda : pandas) {
+    for (const auto &panda : pandas) {
       panda->send_heartbeat(engaged);
     }
   }
@@ -423,7 +422,7 @@ void pandad_run(std::vector<Panda *> &pandas) {
 
   // Start the CAN send thread
   std::thread send_thread(can_send_thread, pandas, fake_send);
-  Params params;
+
   RateKeeper rk("pandad", 100);
   SubMaster sm({"selfdriveState"});
   PubMaster pm({"can", "pandaStates", "peripheralState"});
@@ -444,13 +443,21 @@ void pandad_run(std::vector<Panda *> &pandas) {
     if (rk.frame() % 10 == 0) {
       sm.update(0);
       engaged = sm.allAliveAndValid({"selfdriveState"}) && sm["selfdriveState"].getSelfdriveState().getEnabled();
-      process_panda_state(pandas, &pm, engaged, spoofing_started, params);
+      process_panda_state(pandas, &pm, engaged, spoofing_started);
       panda_safety.configureSafetyMode();
     }
 
     // Send out peripheralState at 2Hz
     if (rk.frame() % 50 == 0) {
       send_peripheral_state(peripheral_panda, &pm);
+    }
+
+    // Forward logs from pandas to cloudlog if available
+    for (auto *panda : pandas) {
+      std::string log = panda->serial_read();
+      if (!log.empty()) {
+        LOGD("%s", log.c_str());
+      }
     }
 
     rk.keepTime();

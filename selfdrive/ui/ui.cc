@@ -6,7 +6,6 @@
 #include <QtConcurrent>
 
 #include "common/transformations/orientation.hpp"
-#include "common/params.h"
 #include "common/swaglog.h"
 #include "common/util.h"
 #include "common/watchdog.h"
@@ -60,8 +59,12 @@ static void update_state(UIState *s) {
   } else if (!sm.allAliveAndValid({"wideRoadCameraState"})) {
     scene.light_sensor = -1;
   }
-  auto params = Params();
-  scene.started = sm["deviceState"].getDeviceState().getStarted() && scene.ignition && !params.getBool("ForceOffroad");
+  if (sm.updated("longitudinalPlan")) {
+    auto lp = sm["longitudinalPlan"].getLongitudinalPlan();
+    scene.carrot_experimental_mode = lp.getXState() == 4;
+  }
+
+  scene.started = sm["deviceState"].getDeviceState().getStarted() && scene.ignition;
 }
 
 void ui_update_params(UIState *s) {
@@ -101,7 +104,8 @@ UIState::UIState(QObject *parent) : QObject(parent) {
     "wideRoadCameraState", "managerState", "selfdriveState", "longitudinalPlan",
     "longitudinalPlan",
     "carControl", "carrotMan", "liveTorqueParameters", "lateralPlan", "liveParameters",
-    "navRoute", "navInstruction", "liveLocationKalman",
+    "navRoute", "navInstruction", "navInstructionCarrot", "liveLocationKalman", "liveDelay",
+    "peripheralState",
   });
   prime_state = new PrimeState(this);
   language = QString::fromStdString(Params().get("LanguageSetting"));
